@@ -6,5 +6,6 @@ pywebview
 akshare
 mootdx
 requests
+python-dotenv>=1.0,<2
 openai
 lightweight-charts

@@ -5,3 +5,4 @@ pandas>=2.2,<4
 numpy>=2,<3
 akshare>=1.18,<2
 requests>=2.32,<3
+python-dotenv>=1.0,<2

@@ -1,0 +1,4 @@
+# Install these in the UI environment to read an external credentials file.
+python-dotenv>=1.0,<2
+# SDK runtime also needs tables; use official AmazingData/tgw wheels, not PyPI's namesake.
+tables>=3.10,<4

@@ -6,6 +6,7 @@ import pytest
 
 from backend.data_manager import DataManager
 from backend import galaxy_data
+from backend import galaxy_runtime
 from backend.kline_processor_enhanced import KLineProcessorEnhanced
 from backend.trade_simulator_enhanced import TradeSimulatorEnhanced
 
@@ -218,7 +219,9 @@ def test_runtime_timeout_stops_only_its_own_container(tmp_path, monkeypatch):
     monkeypatch.setattr(galaxy_data, "ROOT", tmp_path)
     runner = tmp_path / "runner.sh"
     runner.touch()
-    monkeypatch.setattr(galaxy_data, "runner_path", lambda: runner)
+    monkeypatch.setattr(galaxy_runtime, "runner_path", lambda: runner)
+    monkeypatch.setattr(galaxy_runtime, "is_windows", lambda: False)
+    monkeypatch.setenv("KLINE_GALAXY_RUNTIME", "docker")
     command = []
     calls = []
 
@@ -246,7 +249,7 @@ def test_runtime_timeout_stops_only_its_own_container(tmp_path, monkeypatch):
     monkeypatch.setattr(galaxy_data.subprocess, "Popen", Process)
     monkeypatch.setattr(galaxy_data.subprocess, "run", run)
     killed = []
-    monkeypatch.setattr(galaxy_data.os, "killpg", lambda *args: killed.append(args))
+    monkeypatch.setattr(galaxy_data.os, "killpg", lambda *args: killed.append(args), raising=False)
     with pytest.raises(ValueError, match="超时"):
         galaxy_data.query_galaxy("603938.SH", pd.Timestamp("2026-09-17"), pd.Timestamp("2026-09-18"), ["daily"])
     assert len(killed) == 1

@@ -8,7 +8,8 @@ from typing import Dict, List, Optional, Tuple
 import akshare as ak
 import pandas as pd
 
-from backend.galaxy_data import runner_path, sync_galaxy
+from backend.galaxy_data import sync_galaxy
+from backend.galaxy_runtime import runtime_status
 
 try:
     from xtquant import xtdata
@@ -87,12 +88,11 @@ class DataManager:
             {
                 "value": "galaxy",
                 "label": "银河 AmazingData（补数）",
-                "available": runner_path().is_file(),
                 "kind": "online",
                 "supports_incremental_sync": True,
                 "supports_factor": True,
                 "sync_only": True,
-                "description": "使用 ad-api skill 补日线/15分/60分，训练时选择本地离线数据。",
+                **runtime_status(),
             },
             {
                 "value": "akshare",

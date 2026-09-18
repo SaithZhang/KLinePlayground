@@ -1,4 +1,4 @@
-"""One-shot SDK query; run only via the user's ad-api skill runtime."""
+"""One-shot SDK worker, shared by native Python and the macOS ad-api container."""
 import json
 import os
 from pathlib import Path
@@ -6,13 +6,13 @@ import sys
 
 
 def main(request_path, output_path):
-    request = json.loads(Path(request_path).read_text())
+    request = json.loads(Path(request_path).read_text(encoding="utf-8"))
     result = {"periods": {}}
     def progress(stage):
-        Path(output_path + ".stage").write_text(stage)
+        Path(output_path + ".stage").write_text(stage, encoding="utf-8")
     def checkpoint():
         temporary = Path(output_path + ".tmp")
-        temporary.write_text(json.dumps(result, allow_nan=False))
+        temporary.write_text(json.dumps(result, allow_nan=False), encoding="utf-8")
         temporary.replace(output_path)
     progress("IMPORT")
     stage = "IMPORT"
@@ -20,6 +20,7 @@ def main(request_path, output_path):
         import AmazingData as ad
         import pandas as pd
 
+        Path(os.environ["AD_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
         stage = "LOGIN"
         progress(stage)
         ad.login(username=os.environ["AD_USERNAME"], password=os.environ["AD_PASSWORD"],
@@ -73,9 +74,26 @@ def main(request_path, output_path):
     checkpoint()
 
 
+def check_runtime(output_path):
+    """Import native dependencies without logging in or contacting the provider."""
+    try:
+        import AmazingData as ad
+        import pandas
+        import tables
+        import tgw
+        ready = all(hasattr(ad, name) for name in ("login", "BaseData", "MarketData", "constant"))
+        result = {"ready": ready}
+    except Exception as exc:
+        result = {"ready": False, "error": type(exc).__name__}
+    Path(output_path).write_text(json.dumps(result), encoding="utf-8")
+
+
 if __name__ == "__main__":
     # SDK/native login logs can contain credentials. Never forward them to the UI.
     with open(os.devnull, "w") as sink:
         os.dup2(sink.fileno(), 1)
         os.dup2(sink.fileno(), 2)
-        main(sys.argv[1], sys.argv[2])
+        if sys.argv[1] == "--check":
+            check_runtime(sys.argv[2])
+        else:
+            main(sys.argv[1], sys.argv[2])

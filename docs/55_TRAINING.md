@@ -2,6 +2,8 @@
 
 ## 运行
 
+### macOS：保留现有 Docker 结构
+
 ```sh
 uv venv --python 3.13 .venv
 uv pip install --python .venv/bin/python -r requirements-web.txt
@@ -17,6 +19,49 @@ uv pip install --python .venv/bin/python -r requirements-web.txt
 `KLINE_GALAXY_RUNNER` 可覆盖 skill 路径；`AD_DOCKER_IMAGE` 可覆盖镜像。
 项目镜像 `kline-galaxy:1.1.9-tables` 基于已有 QEMU 镜像，仅补充 SDK 复权缓存必需的
 `tables==3.10.2`，不修改其他项目的镜像或全局配置。基础镜像需按 ad-api skill 预先配置。
+
+### Windows：原生 SDK，无需 Docker
+
+准备 64 位 Python（默认 3.12）及银河官方 `AmazingData` / `tgw` wheel。
+`AmazingData` wheel 的 `cp312` / `cp313` 必须与 Python 版本一致；不要安装 PyPI 上的同名旧包。
+官方包位置：https://gitee.com/cgs2026/xysz/tree/master/xysz/xysz_tools 。
+在项目根目录的 `.env` 放置自己的 `AD_USERNAME`、`AD_PASSWORD`、`AD_HOST`、`AD_PORT`，
+也可用 `-EnvFile` 引用已有凭据文件。不要将真实凭据写入命令行、文档或提交到 Git。
+
+```powershell
+# 将占位路径替换为本机银河官方 wheel；只修改本项目的 .venv。
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup_galaxy.ps1 `
+  -AmazingDataWheel 'C:\sdk\AmazingData-1.1.8-cp312-none-any.whl' `
+  -TgwWheel 'C:\sdk\tgw-1.0.8.7-py3-none-any.whl'
+.\start.cmd
+```
+
+如果已有安装完 SDK、pandas 和 tables 的 Python，可改用
+`scripts/setup_galaxy.ps1 -SdkPython 'C:\sdk-env\Scripts\python.exe' -EnvFile 'C:\private\galaxy.env'`；
+此模式只读取外部 SDK 环境，不安装或升级它的包。初始化会做 SDK 导入检查，不登录、不取数。
+本机解释器和凭据文件路径保存在 Git 忽略的 `.runtime/galaxy-native.json`，密码不写入此文件。
+已有完整桌面环境仍使用 `.\start.cmd`；`.\stop.cmd` / `.\restart.cmd` / `.\status.cmd` 管理桌面进程。
+只运行同一套 Web UI 可用 `.\start-web.cmd`，默认 `http://127.0.0.1:8766`，`Ctrl+C` 停止。
+
+### 双平台约定
+
+| 设置 | 行为 |
+| --- | --- |
+| `KLINE_GALAXY_RUNTIME=auto`（默认） | Windows 原生；macOS/Linux 沿用 Docker skill |
+| `KLINE_GALAXY_RUNTIME=native` | 使用兼容本机的 Python SDK；Windows 不调用 shell 或 Docker |
+| `KLINE_GALAXY_PYTHON` | 覆盖原生 SDK 解释器；默认使用应用当前 Python |
+| `KLINE_GALAXY_ENV_FILE` | 原生凭据路径；优先于本机配置，其次项目 `.env`、`~/.config/amazingdata/.env` |
+| `KLINE_GALAXY_RUNNER` / `AD_DOCKER_IMAGE` | 仅用于现有 macOS/Linux Docker 运行路径 |
+
+进程中的 `AD_*` 认证变量优先于凭据文件；兼容 `AD_USER` 用户名别名。
+从其他项目凭据文件只读取上述四项认证配置；默认原生缓存位于 `data/galaxy_sdk_cache`，
+不复用其他项目的缓存。需自定义缓存时单独设置进程环境变量 `AD_CACHE_DIR`。
+两端共用 `scripts/galaxy_worker.py`、补数校验、MA55 训练与归档格式；JSON/回执统一 UTF-8。
+数据源的 `LOCAL_READY` 仅代表本机配置/依赖可用，不代表登录成功或历史数据完整。
+Docker 的 `RUNNER_FOUND` 仅代表 skill 入口存在，容器/连接仍在补数时验证。
+Windows 子进程隐藏控制台，超时终止该次原生 worker 及其虚拟环境启动进程；
+`stop.cmd` 结束已核验的桌面进程树（包括进行中的补数）；Mac 保留进程组与请求级容器清理。
+`.env`、`.env.*`（示例除外）、`.runtime/`、数据/缓存/用户记录均被 Git 忽略。
 
 ## 补数与开局
 
@@ -81,6 +126,22 @@ uv pip install --python .venv/bin/python pytest
 .venv/bin/python -m pytest -q
 node --check frontend/js/main_enhanced.js
 ```
+
+Windows 对应使用 `.venv\Scripts\python.exe -m pytest -q`；首次先安装 `pytest`。
+
+## 2026-09-19 Windows 验收
+
+- 基于 Mac 提交 `4144cf9`，Windows Python 3.12.10、AmazingData 1.1.8、tgw 1.0.8.7、tables 3.11.1。
+- 32 项测试通过，包含真实 Windows 虚拟环境进程树退出、原生子进程通信、中文/空格路径、
+  UTF-8、配置优先级与脱敏、超时部分结果保留，以及模拟 macOS 的 Docker 入口/容器隔离。
+- 使用 Windows 桌面后端真实调用银河：`603938` / `2026-09-17`，日线 1 根、15 分钟 16 根、
+  60 分钟 4 根，三周期均 `COMPLETE`，耗时约 80 秒。这是小范围接入验证，非大批量性能验证。
+- 原生 PyWebView 窗口及银河补数选择器渲染正常；停止后应用/SDK 残留进程为 0；
+  重新启动后 `/api/health` 和 `/api/data/sources` 正常，银河为 `native`。
+- 官方 Windows wheel 安装到项目 `.venv`；凭据只在 Git 忽略的本地 `.env`，
+  对全部已跟踪和可提交新增文件进行凭据匹配检查通过。
+- `start.sh`、`scripts/setup_galaxy.sh`、`scripts/Dockerfile.galaxy` 保持原样。
+  本轮没有 Mac 实机，Mac 的真实 Docker 启动仍需在 Mac 上复验。
 
 ## 2026-09-18 验收记录
 

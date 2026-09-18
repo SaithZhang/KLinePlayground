@@ -85,6 +85,10 @@ MA55/MA233 沿用原自定义 MA 设置。安装、数据口径与使用步骤�
 ## 📦 安装与启动
 
 ### 环境准备
+Windows 原生银河与 macOS Docker 的安装和配置见 [双平台运行说明](docs/55_TRAINING.md#运行)。
+Windows 桌面启动/停止使用 `start.cmd` / `stop.cmd`，状态和重启使用 `status.cmd` / `restart.cmd`；
+Web 入口为 `start-web.cmd`（Windows）或 `./start.sh`（macOS）。
+
 ```bash
 pip install -r requirements.txt
 ```

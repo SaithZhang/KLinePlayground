@@ -6536,3 +6536,7 @@ chart_render_temp.html
 /users/
 /runtime/
 !/main_enhanced.py
+/.runtime/
+.env
+.env.*
+!.env.example

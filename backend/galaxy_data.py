@@ -1,4 +1,4 @@
-"""Galaxy offline supplement using the existing ad-api skill, no SDK in macOS Python."""
+"""Shared Galaxy archive contract for Windows native and macOS Docker workers."""
 import hashlib
 import json
 import os
@@ -13,19 +13,42 @@ import time
 import numpy as np
 import pandas as pd
 
+from backend import galaxy_runtime
+
 PERIODS = ("daily", "15m", "60m")
 ROOT = Path(__file__).resolve().parents[1]
 SYNC_LOCK = threading.Lock()
 
 
-def runner_path():
-    return Path(os.environ.get("KLINE_GALAXY_RUNNER", "~/.codex/skills/ad_api/scripts/run_in_docker.sh")).expanduser()
+def stop_runtime(run, mode, command, env):
+    if galaxy_runtime.is_windows():
+        galaxy_runtime.stop_windows_process(run)
+    else:
+        try:
+            os.killpg(run.pid, signal.SIGTERM)
+            run.wait(timeout=10)
+        except ProcessLookupError:
+            pass
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(run.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            run.wait(timeout=5)
+    if mode == "docker":
+        # Keep the Mac skill's isolation: only stop a container with this exact request.
+        ids = subprocess.run(["docker", "ps", "-q", "--filter", "ancestor=" + env["AD_DOCKER_IMAGE"]],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        for container_id in ids:
+            inspected = subprocess.run(["docker", "inspect", container_id, "--format", "{{json .Config.Cmd}}"],
+                                       capture_output=True, text=True, timeout=10)
+            if inspected.returncode == 0 and json.loads(inspected.stdout) == command[1:]:
+                subprocess.run(["docker", "stop", "-t", "3", container_id],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
 
 
 def query_galaxy(code, start, end, periods):
-    runner = runner_path()
-    if not runner.is_file():
-        raise ValueError("未找到银河 ad-api skill 入口，请设置 KLINE_GALAXY_RUNNER")
+    mode, executable, env = galaxy_runtime.launch_spec()
     runtime = ROOT / "data" / "galaxy_requests"
     runtime.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=runtime) as tmp:
@@ -34,15 +57,16 @@ def query_galaxy(code, start, end, periods):
                 "end": end.strftime("%Y%m%d"), "periods": periods}
         calendar_path = ROOT / "data" / "galaxy_calendar.json"
         if calendar_path.is_file():
-            calendar = json.loads(calendar_path.read_text())
+            calendar = json.loads(calendar_path.read_text(encoding="utf-8"))
             if calendar["start"] <= body["start"] and calendar["end"] >= body["end"]:
                 body["calendar"] = [int(day) for day in calendar["dates"]]
-        request.write_text(json.dumps(body))
-        env = os.environ.copy()
-        env.setdefault("AD_DOCKER_IMAGE", "kline-galaxy:1.1.9-tables")
-        command = [str(runner), str(ROOT / "scripts" / "galaxy_worker.py"), str(request), str(output)]
-        run = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, start_new_session=True)
+        request.write_text(json.dumps(body), encoding="utf-8")
+        command = [executable, str(ROOT / "scripts" / "galaxy_worker.py"), str(request), str(output)]
+        try:
+            run = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, **galaxy_runtime.process_options())
+        except OSError:
+            raise ValueError("银河运行环境启动失败，请检查原生 Python 或 Docker skill 配置") from None
         started = last_progress = time.monotonic()
         stage = "RUNTIME"
         stage_path = Path(str(output) + ".stage")
@@ -53,44 +77,28 @@ def query_galaxy(code, start, end, periods):
                 try:
                     run.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    observed_stage = stage_path.read_text() if stage_path.exists() else stage
+                    observed_stage = stage_path.read_text(encoding="utf-8") if stage_path.exists() else stage
                     if observed_stage and observed_stage != stage:
                         stage, last_progress = observed_stage, time.monotonic()
                     if time.monotonic() - last_progress > 180 or time.monotonic() - started > 480:
                         raise
         except subprocess.TimeoutExpired:
-            # The skill launches a docker child; stopping just its wrapper leaves SDK queries alive.
-            try:
-                os.killpg(run.pid, signal.SIGTERM)
-                run.wait(timeout=10)
-            except ProcessLookupError:
-                pass
-            except subprocess.TimeoutExpired:
-                os.killpg(run.pid, signal.SIGKILL)
-                run.wait(timeout=5)
-            ids = subprocess.run(["docker", "ps", "-q", "--filter", "ancestor=" + env["AD_DOCKER_IMAGE"]],
-                                 capture_output=True, text=True, timeout=10).stdout.split()
-            for container_id in ids:
-                inspected = subprocess.run(["docker", "inspect", container_id, "--format", "{{json .Config.Cmd}}"],
-                                           capture_output=True, text=True, timeout=10)
-                if inspected.returncode == 0 and json.loads(inspected.stdout) == command[1:]:
-                    subprocess.run(["docker", "stop", "-t", "3", container_id],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            stop_runtime(run, mode, command, env)
             if output.is_file():
-                partial = json.loads(output.read_text())
+                partial = json.loads(output.read_text(encoding="utf-8"))
                 if partial.get("periods") and not partial.get("error"):
                     for period in periods:
                         partial["periods"].setdefault(period, {"error": "GALAXY_TIMEOUT_" + stage})
                     return partial
             raise ValueError(f"银河查询 {stage} 超时（单阶段 180 秒/整次 480 秒）；本地文件未改动，请缩短区间后手动重试") from None
         if run.returncode or not output.is_file():
-            raise ValueError("银河运行失败；请检查 Docker、ad-api skill 与全局凭据配置")
-        result = json.loads(output.read_text())
+            raise ValueError("银河运行失败；请检查原生 SDK/Python 或 Docker skill，以及银河凭据配置")
+        result = json.loads(output.read_text(encoding="utf-8"))
         if result.get("error"):
             raise ValueError(result["error"] + "；本地文件未改动")
         if result.get("calendar") and "calendar" not in body:
             calendar_path.write_text(json.dumps({"start": body["start"], "end": body["end"],
-                                                "dates": result["calendar"], "source": "galaxy"}))
+                                                "dates": result["calendar"], "source": "galaxy"}), encoding="utf-8")
         return result
 
 
@@ -201,7 +209,7 @@ def sync_galaxy(manager, stock_code, start_date, end_date, interval="daily", for
             except (ValueError, KeyError, TypeError) as exc:
                 result.update(status="FAILED", success=False, error=str(exc))
             receipt = path.with_suffix(".receipt.json")
-            receipt.write_text(json.dumps(result, ensure_ascii=False, indent=2))
+            receipt.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
             results.append(result)
         manager._offline_stock_codes_cache = None
         manager._offline_date_range_cache.clear()

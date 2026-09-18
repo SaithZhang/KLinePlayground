@@ -583,8 +583,9 @@ function hydrateDataSourceSelect(selectId, includeOffline = false) {
     options.forEach((item) => {
         const option = document.createElement('option');
         option.value = item.value;
-        const disabledText = item.available ? '' : '（未安装）';
+        const disabledText = item.available ? '' : (item.value === 'galaxy' ? '（未就绪）' : '（未安装）');
         option.textContent = `${item.label}${disabledText}`;
+        option.title = item.description || '';
         option.disabled = !item.available;
         select.appendChild(option);
     });
