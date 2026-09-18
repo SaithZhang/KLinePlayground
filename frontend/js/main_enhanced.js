@@ -72,7 +72,7 @@ function updatePeriodBadge(period) {
     currentPeriod = period || 'daily';
     const badge = document.getElementById('current-period');
     if (badge) {
-        badge.textContent = currentPeriod === 'weekly' ? '周K' : '日K';
+        badge.textContent = {daily: '日K', weekly: '周K', '15m': '15分钟', '60m': '60分钟'}[currentPeriod];
     }
     document.querySelectorAll('.view-period-btn').forEach((button) => {
         button.classList.toggle('active', button.dataset.period === currentPeriod);
@@ -576,7 +576,7 @@ function hydrateDataSourceSelect(selectId, includeOffline = false) {
     if (!select) return;
 
     const currentValue = select.value;
-    const options = availableDataSources.filter((item) => includeOffline || item.value !== 'offline');
+    const options = availableDataSources.filter((item) => includeOffline ? !item.sync_only : item.value !== 'offline');
     if (options.length === 0) return;
 
     select.innerHTML = '';
@@ -664,6 +664,15 @@ function setupEventListeners() {
     document.getElementById('start-training-btn').addEventListener('click', startTraining);
 
     // 设置按钮
+    document.getElementById('training-practice')?.addEventListener('change', (event) => {
+        if (event.target.value === 'ma55') {
+            document.getElementById('data-source').value = 'offline';
+            document.getElementById('kline-period').value = '15m';
+        }
+    });
+    document.getElementById('sync-interval')?.addEventListener('change', (event) => {
+        if (event.target.value !== 'daily') document.getElementById('sync-source').value = 'galaxy';
+    });
     document.getElementById('settings-btn')?.addEventListener('click', showSettings);
     document.getElementById('save-settings-btn')?.addEventListener('click', saveSettings);
     document.getElementById('cancel-settings-btn')?.addEventListener('click', hideSettings);
@@ -1174,7 +1183,9 @@ function showDataSyncModal() {
 
     if (stockInput && currentStock) stockInput.value = currentStock;
     if (startInput && !startInput.value) {
-        startInput.value = '2010-01-01';
+        const historyStart = new Date();
+        historyStart.setFullYear(historyStart.getFullYear() - 1);
+        startInput.value = historyStart.toISOString().split('T')[0];
     }
     if (endInput && !endInput.value) {
         endInput.value = new Date().toISOString().split('T')[0];
@@ -1267,6 +1278,7 @@ async function syncSingleStock(stockCode, source, startDate, endDate, forceFull)
             start_date: startDate || null,
             end_date: endDate || null,
             force_full: forceFull,
+            interval: document.getElementById('sync-interval').value,
         }),
     });
     const result = await response.json();
@@ -1323,6 +1335,11 @@ async function syncOfflineData() {
                     : '';
                 const fileStateText = result.local_file_changed === false ? ' 本地文件未改动。' : '';
                 resultBox.textContent = `完成: ${result.message} 请求区间 ${describeSyncRange(startDate, endDate)}，本地范围 ${beforeRange} -> ${afterRange}，新增 ${result.added_rows || 0} 条，抓取 ${result.fetched_rows || 0} 条。${plannedRangeText}${fetchedRangeText}${missingRangeText}${fileStateText}`;
+                if (result.periods) {
+                    resultBox.textContent = `${result.status} · ${result.message}\n` + result.periods.map(item =>
+                        `${item.period}: ${item.status} · 抓取 ${item.fetched_rows} / 预期 ${item.expected_bars ?? '?'} · 缺口 ${item.missing_bars?.length ?? '?'} · ${item.error || item.gap_reason || '已齐'}${item.missing_bars?.length ? ' · 示例 ' + item.missing_bars.slice(0, 5).join(', ') : ''}`
+                    ).join('\n');
+                }
             }
         } else {
             const universeResponse = await fetch(`${API_BASE}/data/stock_universe?market=${scope}`);
@@ -1347,9 +1364,10 @@ async function syncOfflineData() {
                 updateSyncProgress(index, stockCodes.length, `正在补数 ${index + 1}/${stockCodes.length}：${code}`);
                 try {
                     const result = await syncSingleStock(code, source, startDate, endDate, forceFull);
-                    successCount += 1;
+                    if (result.success === false) failureCount += 1;
+                    else successCount += 1;
                     addedRows += result.added_rows || 0;
-                    latestSuccessCode = code;
+                    if (result.success !== false) latestSuccessCode = code;
                 } catch (error) {
                     failureCount += 1;
                     console.error(`批量补数失败 ${code}:`, error);
@@ -1411,17 +1429,23 @@ function renderMaPeriodsEditor() {
         addBtn.className = 'btn-add-ma';
         addBtn.type = 'button';
         addBtn.textContent = '+';
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = '1';
+        input.step = '1';
+        input.placeholder = '55 / 233';
+        input.setAttribute('aria-label', '新增均线周期');
+        input.style.width = '100px';
+        addBtn.setAttribute('aria-label', '添加均线');
         addBtn.onclick = () => {
-            const val = prompt('输入新的均线周期 (如: 60):');
-            if (val && !isNaN(val)) {
-                const p = parseInt(val);
-                if (p > 0 && !maPeriods.includes(p)) {
-                    maPeriods.push(p);
-                    maPeriods.sort((a, b) => a - b);
-                    renderMaPeriodsEditor();
-                }
+            const p = Number(input.value);
+            if (Number.isInteger(p) && p > 0 && !maPeriods.includes(p)) {
+                maPeriods.push(p);
+                maPeriods.sort((a, b) => a - b);
+                renderMaPeriodsEditor();
             }
         };
+        container.appendChild(input);
         container.appendChild(addBtn);
     }
 
@@ -1623,6 +1647,12 @@ function applyTrainingSnapshot(data, options = {}) {
         currentTraining.tradeMarkers = data.trade_markers || [];
     }
 
+    if (data.practice_context) {
+        document.getElementById('ma55-coverage').textContent = Object.entries(data.practice_context).map(([period, info]) => {
+            const label = {daily: '日线', '60m': '60分', '15m': '15分'}[period];
+            return `${label}：${info.error || `${info.bars}根 · ${info.as_of} · MA55${info.ma55_ready ? '可用' : '不足'} / MA233${info.ma233_ready ? '可用' : '不足'}`}`;
+        }).join('；');
+    }
     candlestickSeries.setData(data.kline_data);
     volumeSeries.setData(data.volume_data || []);
     replaceRenderedKlineData(data.kline_data);
@@ -1640,7 +1670,7 @@ function applyTrainingSnapshot(data, options = {}) {
     updateTradeMarkers(data.trade_markers || []);
 
     if (fitContent) {
-        chart.timeScale().fitContent();
+        setVisibleRangeAll({ from: Math.max(0, data.kline_data.length - 80), to: data.kline_data.length + 3 });
     }
 }
 
@@ -1652,7 +1682,8 @@ async function refreshTrainingView(options = {}) {
     const dataEndpoint = isViewOnlyMode ? 'full_data' : 'data';
     const response = await fetch(`${API_BASE}/training/${currentTraining.id}/${dataEndpoint}?ma_periods=${maQuery}&${getViewPeriodQuery()}`);
     if (!response.ok) {
-        throw new Error(`刷新训练视图失败: ${response.status}`);
+        const error = await response.json();
+        throw new Error(error.error || `刷新训练视图失败: ${response.status}`);
     }
 
     const data = await response.json();
@@ -1668,7 +1699,8 @@ async function refreshTrainingView(options = {}) {
 }
 
 async function switchViewPeriod(period) {
-    const nextPeriod = period === 'weekly' ? 'weekly' : 'daily';
+    const nextPeriod = ['daily', 'weekly', '15m', '60m'].includes(period) ? period : 'daily';
+    const previousPeriod = currentPeriod;
     if (currentPeriod === nextPeriod) {
         updatePeriodBadge(nextPeriod);
         return;
@@ -1684,7 +1716,8 @@ async function switchViewPeriod(period) {
         await refreshTrainingView({ preserveRange: false, fitContent: true });
     } catch (error) {
         console.error('切换K线视图失败:', error);
-        alert('切换K线视图失败');
+        updatePeriodBadge(previousPeriod);
+        alert(error.message || '切换K线视图失败');
     } finally {
         hideLoading();
     }
@@ -1694,15 +1727,19 @@ async function switchViewPeriod(period) {
 async function startTraining() {
     const isRandomMode = document.querySelector('.tab-btn.active').dataset.tab === 'random';
     const initialCapital = parseFloat(document.getElementById('initial-capital').value);
-    const dataSource = document.getElementById('data-source').value || 'akshare';
-    const period = 'daily';
+    const practice = document.getElementById('training-practice').value;
+    const dataSource = practice === 'ma55' ? 'offline' : document.getElementById('data-source').value || 'akshare';
+    const period = practice === 'ma55' ? '15m' : document.getElementById('kline-period').value;
+    await loadUserSettings();
+    if (practice === 'ma55') maPeriods = [5, 10, 20, 55, 233];
 
     let trainingConfig = {
         user: currentUser,
         initial_capital: initialCapital,
         mode: isRandomMode ? 'random' : 'specified',
         data_source: dataSource,
-        period: period
+        period: period,
+        practice
     };
 
     if (isRandomMode) {
@@ -1723,7 +1760,7 @@ async function startTraining() {
     }
 
     try {
-        updatePeriodBadge('daily');
+        updatePeriodBadge(period);
         showLoading(
             dataSource === 'offline' ? '正在筛选本地离线数据' : '正在创建训练',
             dataSource === 'offline' ? '首次校验离线股票可用范围时会稍慢一些。' : '正在准备图表和训练数据...'
@@ -1738,7 +1775,11 @@ async function startTraining() {
 
         if (response.ok) {
             currentTraining = await response.json();
-            currentTraining.period = 'daily';
+            document.getElementById('ma55-practice-panel').classList.toggle('hidden', practice !== 'ma55');
+            document.querySelectorAll('#ma55-practice-panel input').forEach(input => { input.checked = false; });
+            const adjustment = currentTraining.adjustment_mode || 'forward';
+            document.querySelector(`input[name="adjustment"][value="${adjustment}"]`).checked = true;
+            document.getElementById('adjustment-mode').value = adjustment;
             currentReportData = null;
             hideTrainingSetup();
             document.getElementById('report-interface').classList.add('hidden');
@@ -1746,12 +1787,6 @@ async function startTraining() {
             initializeChart();
             await loadInitialData();
             await updateChipDistribution(); // 加入此行，初始化筹码分布
-
-            // 在所有内容加载完毕后，自动触发一次 nextBar
-            // 我们加一个小的延时，确保图表渲染完成，视觉效果更平滑
-            setTimeout(() => {
-                nextBar();
-            }, 100); // 100毫秒的延时
 
             startAutoSync();
         } else {
@@ -1826,7 +1861,7 @@ function initializeChart() {
                 const month = ('0' + (date.getUTCMonth() + 1)).slice(-2); // 月份从0开始
                 const day = ('0' + date.getUTCDate()).slice(-2);
 
-                return `${year}年${month}月${day}日`;
+                return `${year}年${month}月${day}日` + (['15m', '60m'].includes(currentPeriod) ? ` ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}` : '');
             },
             locale: 'zh-CN',
         },
@@ -1836,7 +1871,7 @@ function initializeChart() {
             secondsVisible: false,
             tickMarkFormatter: (time) => {
                 const date = new Date(time * 1000);
-                return `${date.getFullYear()}/${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}`;
+                return ['15m', '60m'].includes(currentPeriod) ? `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}` : `${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
             }
         },
     });
@@ -1905,7 +1940,7 @@ function initializeChart() {
             visible: false,
             tickMarkFormatter: (time) => {
                 const date = new Date(time * 1000);
-                return `${date.getFullYear()}/${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}`;
+                return ['15m', '60m'].includes(currentPeriod) ? `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}` : `${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
             }
         },
     });
@@ -1959,7 +1994,7 @@ function initializeChart() {
             visible: false,
             tickMarkFormatter: (time) => {
                 const date = new Date(time * 1000);
-                return `${date.getFullYear()}/${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}`;
+                return ['15m', '60m'].includes(currentPeriod) ? `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}` : `${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
             }
         },
     });
@@ -1977,21 +2012,8 @@ function initializeChart() {
         scheduleChipDistributionRender();
     });
 
-    // 监听成交量图表的时间轴变化
-    volumeChart.timeScale().subscribeVisibleLogicalRangeChange(timeRange => {
-        if (timeRange) {
-            chart.timeScale().setVisibleLogicalRange(timeRange);
-            indicatorChart.timeScale().setVisibleLogicalRange(timeRange);
-        }
-    });
-
-    // 监听技术指标图表的时间轴变化
-    indicatorChart.timeScale().subscribeVisibleLogicalRangeChange(timeRange => {
-        if (timeRange) {
-            chart.timeScale().setVisibleLogicalRange(timeRange);
-            volumeChart.timeScale().setVisibleLogicalRange(timeRange);
-        }
-    });
+    // The candle chart owns the viewport. Replacing a secondary series during
+    // a period change must not feed its stale logical range back into the main chart.
 
     function getCrosshairDataPoint(series, param) {
         if (!param.time) {
@@ -2243,7 +2265,7 @@ async function loadInitialData() {
 
         // 更新股票信息
         document.getElementById('stock-name').textContent = data.stock_name || '未知股票';
-        applyTrainingSnapshot(data);
+        applyTrainingSnapshot(data, { fitContent: true });
 
         // 加载技术指标
         await loadTechnicalIndicator(currentIndicatorType);
@@ -2296,11 +2318,11 @@ function updateCurrentInfo(barData, progress) {
 
     const date = new Date(barData.time * 1000);
     const formattedDate = `${date.getFullYear()}/${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}`;
-    document.getElementById('current-date').textContent = formattedDate;
+    document.getElementById('current-date').textContent = progress?.current_time || formattedDate;
     document.getElementById('current-price').textContent = `¥${barData.close.toFixed(2)}`;
 
     // 显示当前bar ID
-    document.getElementById('current-bar-id').textContent = `Bar ID: ${barData.bar_id || 'N/A'}`;
+    document.getElementById('current-bar-id').textContent = `Bar ID: ${progress?.current_bar_id ?? barData.bar_id ?? 'N/A'}`;
 
     // 更新当日详情
     document.getElementById('open-price').textContent = `¥${barData.open.toFixed(2)}`;
@@ -2468,7 +2490,7 @@ async function nextBar() {
             } else {
                 // 更新图表数据
                 if (data.new_bar) {
-                    if (currentPeriod === 'weekly') {
+                    if (currentPeriod !== currentTraining.period || currentTraining.practice === 'ma55') {
                         await refreshTrainingView({ preserveRange: true });
                     } else {
                         candlestickSeries.update(data.new_bar);
@@ -2518,7 +2540,7 @@ async function nextBar() {
 
 async function updateMovingAverages() {
     try {
-        const response = await fetch(`${API_BASE}/training/${currentTraining.id}/data?${getViewPeriodQuery()}`);
+        const response = await fetch(`${API_BASE}/training/${currentTraining.id}/data?ma_periods=${maPeriods.join(',')}&${getViewPeriodQuery()}`);
         const data = await response.json();
 
         if (data.ma_data) {
@@ -2746,7 +2768,7 @@ async function updateAdjustment(targetRange = null) {
             applyTrainingSnapshot({
                 ...data,
                 progress: currentTraining?.latestProgress || null,
-                trade_markers: currentPeriod === 'daily' ? (currentTraining?.tradeMarkers || []) : []
+                trade_markers: currentPeriod === currentTraining?.period ? (currentTraining?.tradeMarkers || []) : []
             });
             renderChartLegend();
             

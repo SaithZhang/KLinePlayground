@@ -21,6 +21,7 @@ class KLineProcessorEnhanced:
         self.interval = interval
         self.start_date = pd.to_datetime(start_date)
         self.adjustment_mode = "forward"
+        self._context_frames = {}
         self.factor_changed = False
 
         self.raw_data = data_manager.get_stock_data(stock_code, source=source, interval=interval)
@@ -36,12 +37,12 @@ class KLineProcessorEnhanced:
             raise ValueError(f"起始日期 {start_date} 之后没有数据")
 
         self.start_index = int(start_mask.idxmax())
-        self.preview_start_index = max(0, self.start_index - 80)
+        self.preview_start_index = 0  # Retain all available past bars for MA233 and weekly warmup.
         self.full_data = self.raw_data.iloc[self.preview_start_index :].copy().reset_index(drop=True)
         if self.full_data.empty:
             raise ValueError(f"起始日期 {start_date} 之后没有数据")
 
-        self.preview_bars = min(80, self.start_index - self.preview_start_index)
+        self.preview_bars = self.start_index - self.preview_start_index
         self.current_index = self.preview_bars
         self.max_index = len(self.full_data) - 1
         self.bar_id_offset = -self.preview_bars + 1
@@ -70,7 +71,7 @@ class KLineProcessorEnhanced:
             latest_factor = self.full_data.iloc[-1]["factor"]
             result["adj_ratio"] = result["factor"] / latest_factor
         elif mode == "backward":
-            base_factor = result.iloc[0]["factor"]
+            base_factor = self.full_data.iloc[0]["factor"]
             result["adj_ratio"] = result["factor"] / base_factor
         elif mode == "dynamic_forward":
             current_factor = self.full_data.iloc[self.current_index]["factor"]
@@ -107,9 +108,12 @@ class KLineProcessorEnhanced:
         if "amount" in frame.columns:
             aggregations["amount"] = "sum"
 
+        frame["last_date"] = frame.index
+        aggregations["last_date"] = "last"
         weekly = frame.resample("W-FRI").agg(aggregations)
         weekly = weekly.dropna(subset=["open", "high", "low", "close"])
-        return weekly.reset_index()
+        weekly = weekly.reset_index(drop=True).rename(columns={"last_date": "date"})
+        return weekly
 
     def _build_bar_meta(self, data: pd.DataFrame) -> List[Dict]:
         if data is None or data.empty:
@@ -130,9 +134,46 @@ class KLineProcessorEnhanced:
         return meta
 
     def _get_adjusted_frame(self, view_period: str = "daily", full: bool = False) -> pd.DataFrame:
-        source_frame = self.full_data.copy() if full else self.full_data.iloc[: self.current_index + 1].copy()
+        if view_period not in {"daily", "weekly", "15m", "60m"}:
+            raise ValueError("不支持的视图周期")
+        # A single playback clock drives every view. Daily bars become known at 15:00.
+        cursor = self.full_data.iloc[-1 if full else self.current_index]["date"]
+        cutoff = cursor + pd.Timedelta(hours=15) if self.interval in {"daily", "weekly"} else cursor
+        storage_period = "daily" if view_period == "weekly" else view_period
+        if storage_period == self.interval:
+            source_frame = self.full_data.copy() if full else self.full_data.iloc[:self.current_index + 1].copy()
+        else:
+            if storage_period not in self._context_frames:
+                frame = self.data_manager.get_stock_data(self.stock_code, source=self.source, interval=storage_period)
+                if frame is None or frame.empty:
+                    raise ValueError(f"缺少 {storage_period} 数据，请先用银河补齐三周期离线数据")
+                factors = self.data_manager.get_factor_data(self.stock_code, source=self.source, interval=storage_period)
+                frame = frame.copy().drop(columns=["factor"], errors="ignore")
+                if factors is not None and not factors.empty:
+                    frame = frame.merge(factors[["date", "factor"]], on="date", how="left")
+                else:
+                    frame["factor"] = 1.0
+                self._context_frames[storage_period] = frame.sort_values("date").reset_index(drop=True)
+            source_frame = self._context_frames[storage_period].copy()
+        completed_at = source_frame.date + pd.Timedelta(hours=15) if storage_period == "daily" else source_frame.date
+        source_frame = source_frame.loc[completed_at <= cutoff].copy()
         adjusted = self._calculate_adjusted_prices(source_frame, self.adjustment_mode)
         return self._resample_view_frame(adjusted, view_period=view_period)
+
+    def get_practice_context(self):
+        context = {}
+        for period in ("daily", "60m", "15m"):
+            try:
+                frame = self._get_adjusted_frame(period)
+                context[period] = {
+                    "bars": len(frame),
+                    "as_of": str(frame.date.iloc[-1]) if len(frame) else None,
+                    "ma55_ready": len(frame) >= 55,
+                    "ma233_ready": len(frame) >= 233,
+                }
+            except ValueError as exc:
+                context[period] = {"bars": 0, "error": str(exc), "ma55_ready": False, "ma233_ready": False}
+        return context
 
     def _to_chart_rows(self, data: pd.DataFrame) -> List[Dict]:
         meta = self._build_bar_meta(data)
@@ -296,6 +337,7 @@ class KLineProcessorEnhanced:
             "total_bars": len(self.full_data),
             "training_progress": (training_current / training_total) * 100,
             "current_date": self.get_current_date(),
+            "current_time": str(self.full_data.iloc[self.current_index]["date"]),
             "start_date": self.start_date.strftime("%Y-%m-%d"),
             "end_date": self.full_data.iloc[-1]["date"].strftime("%Y-%m-%d"),
             "preview_bars": self.preview_bars,

@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Tuple
 import akshare as ak
 import pandas as pd
 
+from backend.galaxy_data import runner_path, sync_galaxy
+
 try:
     from xtquant import xtdata
 
@@ -83,6 +85,16 @@ class DataManager:
         """返回当前可用数据源列表。"""
         return [
             {
+                "value": "galaxy",
+                "label": "银河 AmazingData（补数）",
+                "available": runner_path().is_file(),
+                "kind": "online",
+                "supports_incremental_sync": True,
+                "supports_factor": True,
+                "sync_only": True,
+                "description": "使用 ad-api skill 补日线/15分/60分，训练时选择本地离线数据。",
+            },
+            {
                 "value": "akshare",
                 "label": "AKShare",
                 "available": True,
@@ -146,9 +158,18 @@ class DataManager:
             return ""
         return digits[-6:].zfill(6)
 
-    def _get_offline_file(self, stock_code: str) -> Optional[str]:
+    def _get_offline_file(self, stock_code: str, interval: str = "daily") -> Optional[str]:
         stock_code = self._normalize_stock_code(stock_code)
         if not stock_code:
+            return None
+        storage_period = "daily" if interval == "weekly" else interval
+        if storage_period not in {"daily", "15m", "60m"}:
+            raise ValueError("不支持的 K 线周期")
+        for suffix in (".SZ", ".SH", ".BJ"):
+            galaxy = os.path.join(self.offline_dir, "galaxy", storage_period, f"{stock_code}{suffix}.csv")
+            if os.path.exists(galaxy):
+                return galaxy
+        if storage_period != "daily":
             return None
         for suffix in (".SZ", ".SH", ".BJ"):
             candidate = os.path.join(self.offline_dir, f"{stock_code}{suffix}.csv")
@@ -243,20 +264,13 @@ class DataManager:
             return None
         return row[index]
 
-    def _get_offline_stock_codes(self) -> List[str]:
-        if self._offline_stock_codes_cache is not None:
-            return list(self._offline_stock_codes_cache)
-
-        stock_codes = set()
-        for filename in os.listdir(self.offline_dir):
-            if not filename.lower().endswith(".csv"):
-                continue
-            stock_code = self._normalize_stock_code(os.path.splitext(filename)[0])
-            if stock_code:
-                stock_codes.add(stock_code)
-
-        self._offline_stock_codes_cache = sorted(stock_codes)
-        return list(self._offline_stock_codes_cache)
+    def _get_offline_stock_codes(self, interval="daily") -> List[str]:
+        from pathlib import Path
+        storage_period = "daily" if interval == "weekly" else interval
+        paths = list((Path(self.offline_dir) / "galaxy" / storage_period).glob("*.csv"))
+        if storage_period == "daily":
+            paths.extend(Path(self.offline_dir).glob("*.csv"))
+        return sorted({self._normalize_stock_code(path.stem) for path in paths})
 
     def _filter_stock_codes_by_sector(self, stock_codes: List[str], sector: str) -> List[str]:
         if sector == "main":
@@ -353,7 +367,7 @@ class DataManager:
         interval: str = "daily",
     ) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
         stock_code = self._normalize_stock_code(stock_code)
-        if source == "offline":
+        if source == "offline" and interval in {"daily", "weekly"}:
             return self._get_offline_date_range(stock_code)
 
         data = self.get_stock_data(stock_code, source=source, interval=interval)
@@ -924,9 +938,13 @@ class DataManager:
     ) -> Optional[pd.DataFrame]:
         """获取股票 K 线数据，支持日K与周K。"""
         stock_code = self._normalize_stock_code(stock_code)
+        if interval not in {"daily", "weekly", "15m", "60m"}:
+            raise ValueError("不支持的 K 线周期")
+        if source != "offline" and interval in {"15m", "60m"}:
+            raise ValueError("分钟训练请先用银河补数，再选择本地离线数据")
         try:
             if source == "offline":
-                offline_path = self._get_offline_file(stock_code)
+                offline_path = self._get_offline_file(stock_code, interval)
                 if not offline_path:
                     return None
                 data = self._read_csv_with_fallback(offline_path)
@@ -958,9 +976,13 @@ class DataManager:
     ) -> Optional[pd.DataFrame]:
         """获取复权因子数据，周K会按周最后一个交易日聚合。"""
         stock_code = self._normalize_stock_code(stock_code)
+        if interval not in {"daily", "weekly", "15m", "60m"}:
+            raise ValueError("不支持的 K 线周期")
+        if source != "offline" and interval in {"15m", "60m"}:
+            raise ValueError("分钟训练请先用银河补数，再选择本地离线数据")
         try:
             if source == "offline":
-                offline_path = self._get_offline_file(stock_code)
+                offline_path = self._get_offline_file(stock_code, interval)
                 if not offline_path:
                     return None
                 data = self._read_csv_with_fallback(offline_path)
@@ -995,7 +1017,7 @@ class DataManager:
 
     def get_stock_name(self, stock_code: str) -> str:
         stock_code = self._normalize_stock_code(stock_code)
-        if not self.stock_names:
+        if not self.stock_names and os.path.exists(os.path.join(self.data_dir, "stock_names.json")):
             self.load_stock_list()
         return self.stock_names.get(stock_code, f"股票{stock_code}")
 
@@ -1018,14 +1040,14 @@ class DataManager:
         data = self.get_stock_data(stock_code, source=source, interval=interval)
         if data is None or data.empty:
             if source == "offline":
-                if self._get_offline_file(stock_code) is None:
+                if self._get_offline_file(stock_code, interval) is None:
                     return "指定股票在离线数据中不存在"
                 return "指定股票在离线数据中没有可用数据"
             return "指定股票暂无可用数据，请切换数据源或稍后重试"
 
         min_date = data["date"].min()
         max_date = data["date"].max()
-        if start_dt < min_date or start_dt > max_date:
+        if start_dt.normalize() < min_date.normalize() or start_dt.normalize() > max_date.normalize():
             if source == "offline":
                 return f"起始日期不在该股票离线数据范围内（{min_date:%Y-%m-%d} ~ {max_date:%Y-%m-%d}）"
             return f"起始日期不在该股票数据范围内（{min_date:%Y-%m-%d} ~ {max_date:%Y-%m-%d}）"
@@ -1059,16 +1081,16 @@ class DataManager:
         range_start, range_end = self._resolve_training_range(date_start, date_end)
 
         if source == "offline":
-            stock_codes = self._filter_stock_codes_by_sector(self._get_offline_stock_codes(), sector)
+            stock_codes = self._filter_stock_codes_by_sector(self._get_offline_stock_codes(interval), sector)
             candidates: List[Tuple[str, pd.Timestamp, pd.Timestamp]] = []
 
             for stock_code in stock_codes:
-                date_range = self._get_offline_date_range(stock_code)
+                date_range = self._get_stock_date_range(stock_code, source="offline", interval=interval)
                 if date_range is None:
                     continue
                 stock_start, stock_end = date_range
-                available_start = max(range_start, stock_start)
-                available_end = min(range_end, stock_end)
+                available_start = max(range_start, stock_start.normalize())
+                available_end = min(range_end, stock_end.normalize())
                 if available_start <= available_end:
                     candidates.append((stock_code, available_start, available_end))
 
@@ -1096,8 +1118,8 @@ class DataManager:
             if date_range is None:
                 continue
             stock_start, stock_end = date_range
-            available_start = max(range_start, stock_start)
-            available_end = min(range_end, stock_end)
+            available_start = max(range_start, stock_start.normalize())
+            available_end = min(range_end, stock_end.normalize())
             if available_start <= available_end:
                 return stock_code, self._random_date_in_range(available_start, available_end)
 
@@ -1117,12 +1139,19 @@ class DataManager:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         force_full: bool = False,
+        interval: str = "daily",
     ) -> Dict:
         """将在线数据源按日期区间增量同步到离线目录。"""
+        if source == "galaxy":
+            return sync_galaxy(self, stock_code, start_date, end_date, interval, force_full)
+        if interval != "daily":
+            raise ValueError("15/60 分钟补数请选择银河数据源")
         stock_code = self._normalize_stock_code(stock_code)
         if source == "offline":
             raise ValueError("离线数据不能作为在线补数源。")
 
+        if self._get_offline_file(stock_code) and "galaxy" + os.sep in self._get_offline_file(stock_code):
+            raise ValueError("该股票已使用银河归档，请继续用银河补数，避免混合不同来源")
         existing = self.get_stock_data(stock_code, source="offline", interval="daily")
         existing_factor = self.get_factor_data(stock_code, source="offline", interval="daily")
         request_start, request_end = self._normalize_sync_range(start_date=start_date, end_date=end_date)

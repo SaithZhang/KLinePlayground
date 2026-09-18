@@ -294,6 +294,13 @@ def start_training():
         data_source = data.get('data_source', 'akshare')
         period = data.get('period', 'daily')
         initial_capital = data.get('initial_capital', 100000)
+        practice = data.get('practice', 'free')
+        if practice not in {'free', 'ma55'}:
+            return jsonify({'error': '未知训练预设'}), 400
+        if practice == 'ma55':
+            data_source, period = 'offline', '15m'
+        if period not in {'daily', 'weekly', '15m', '60m'}:
+            return jsonify({'error': '训练步长支持日线、15 分钟、60 分钟'}), 400
         
         if not user:
             return jsonify({'error': '用户名不能为空'}), 400
@@ -336,7 +343,17 @@ def start_training():
         
         # 创建增强版K线处理器和交易模拟器
         kline_processor = KLineProcessorEnhanced(data_manager, stock_code, start_date, source=data_source, interval=period)
-        trade_simulator = TradeSimulatorEnhanced(user, initial_capital, stock_code)
+        if practice == 'ma55':
+            for required_period in ('daily', '60m', '15m'):
+                archive_path = data_manager._get_offline_file(stock_code, required_period)
+                if not archive_path or 'galaxy' + os.sep not in archive_path:
+                    raise ValueError('55 战法请先用银河补齐日线、15分、60分，保持统一复权口径')
+            kline_processor.set_adjustment('dynamic_forward')
+            for context_period in ('daily', '60m'):
+                kline_processor._get_adjusted_frame(context_period)
+        trade_simulator = TradeSimulatorEnhanced(user, initial_capital, stock_code, users_dir=users_dir_path)
+        first_bar = kline_processor.get_current_bar()
+        trade_simulator.update_current_price(first_bar['close'], first_bar['bar_id'])
         
         # 获取用户设置并应用到交易模拟器
         user_config = user_manager.get_user_config(user)
@@ -357,6 +374,7 @@ def start_training():
             'trade_simulator': trade_simulator,
             'mode': mode,
             'data_source': data_source,
+            'practice': practice,
             'period': period,
             'created_at': datetime.now()
         }
@@ -369,6 +387,8 @@ def start_training():
             'start_date': start_date,
             'mode': mode,
             'data_source': data_source,
+            'practice': practice,
+            'adjustment_mode': kline_processor.adjustment_mode,
             'period': period
         })
     except ValueError as e:
@@ -412,9 +432,10 @@ def get_training_data(training_id):
             'volume_data': volume_data,
             'ma_data': ma_data,
             'progress': progress,
-            'trade_markers': kline_processor.get_trade_markers() if view_period == 'daily' else [],
+            'trade_markers': kline_processor.get_trade_markers() if view_period == kline_processor.interval else [],
             'period': training.get('period', 'daily'),
             'view_period': view_period,
+            'practice_context': kline_processor.get_practice_context() if training.get('practice') == 'ma55' else None,
             'data_source': training.get('data_source', 'akshare')
         })
     except Exception as e:
@@ -541,7 +562,7 @@ def get_full_data(training_id):
         kline_processor = training['kline_processor']
         view_period = request.args.get('view_period', 'daily')
         
-        kline_data = kline_processor.get_full_data(view_period=view_period)
+        kline_data = []
         
         # 获取均线周期参数
         ma_periods_str = request.args.get('ma_periods', '5,10,20')
@@ -561,6 +582,7 @@ def get_full_data(training_id):
         kline_processor.current_index = kline_processor.max_index
         
         try:
+            kline_data = kline_processor.get_full_data(view_period=view_period)
             volume_data = kline_processor.get_volume_data(view_period=view_period)
             ma_data = kline_processor.get_ma_data(ma_periods, view_period=view_period)
         finally:
@@ -571,9 +593,10 @@ def get_full_data(training_id):
             'kline_data': kline_data,
             'volume_data': volume_data,
             'ma_data': ma_data,
-            'trade_markers': kline_processor.get_trade_markers() if view_period == 'daily' else [],
+            'trade_markers': kline_processor.get_trade_markers() if view_period == kline_processor.interval else [],
             'period': training.get('period', 'daily'),
             'view_period': view_period,
+            'practice_context': kline_processor.get_practice_context() if training.get('practice') == 'ma55' else None,
             'data_source': training.get('data_source', 'akshare')
         })
     except Exception as e:
@@ -865,6 +888,7 @@ def sync_offline_data():
             start_date=start_date,
             end_date=end_date,
             force_full=force_full,
+            interval=data.get('interval', 'daily'),
         )
         return jsonify(result)
     except Exception as e:

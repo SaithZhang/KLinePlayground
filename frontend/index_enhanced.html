@@ -119,7 +119,8 @@
                         <label>默认 K 线周期</label>
                         <select id="default-period">
                             <option value="daily">日K</option>
-                            <option value="weekly">周K</option>
+                            <option value="15m">15 分钟</option>
+                            <option value="60m">60 分钟</option>
                         </select>
                     </div>
                 </div>
@@ -223,11 +224,19 @@
                             <option value="offline">本地离线数据</option>
                         </select>
                     </div>
-                    <div class="form-group hidden">
-                        <label>K线周期</label>
+                    <div class="form-group">
+                        <label for="training-practice">训练预设</label>
+                        <select id="training-practice">
+                            <option value="free">自由训练</option>
+                            <option value="ma55">55 战法（离线 · 15分推进）</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>K线推进周期</label>
                         <select id="kline-period">
                             <option value="daily" selected>日K</option>
-                            <option value="weekly">周K</option>
+                            <option value="15m">15 分钟</option>
+                            <option value="60m">60 分钟</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -246,7 +255,7 @@
         <div id="data-sync-modal" class="modal hidden">
             <div class="modal-content">
                 <h2>增量补充离线数据</h2>
-                <p class="helper-text">用 AKShare、xtdata 或 mootdx 按日期区间补齐本地离线目录。系统会先检查本地已有时间范围，只增量补缺口。</p>
+                <p class="helper-text">公开源补日线；银河通过已配置的 ad-api skill 补日线、15分、60分。银河会重查所选区间以修复内部缺口，同源合并，保留区间外历史；缺失时段会明确列出。</p>
                 <div class="form-grid">
                     <div class="form-group">
                         <label>补数范围</label>
@@ -267,6 +276,15 @@
                             <option value="akshare" selected>AKShare</option>
                             <option value="xtdata" hidden>xtdata / XTQuant</option>
                             <option value="mootdx" hidden>mootdx</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="sync-interval">补数周期</label>
+                        <select id="sync-interval">
+                            <option value="daily">日线</option>
+                            <option value="15m">15 分钟（银河）</option>
+                            <option value="60m">60 分钟（银河）</option>
+                            <option value="all">55 战法三周期（日/15分/60分）</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -298,6 +316,17 @@
 
         <div id="training-interface" class="hidden">
             <div class="left-panel">
+                <div id="ma55-practice-panel" class="control-section hidden">
+                    <h3>55 战法观察清单</h3>
+                    <p class="helper-text">日线趋势 → 15分 MA55 回踩/收复 → 60分对照。成交与推进按15分 K线；切换视图仅作对照。只显示回放时刻已完成的 K 线。</p>
+                    <p id="ma55-coverage" class="helper-text"></p>
+                    <label><input type="checkbox"> 日线 MA5/10/20 趋势、MA55 位置</label><br>
+                    <label><input type="checkbox"> 量能与自身均量比较</label><br>
+                    <label><input type="checkbox"> 15分下击/回踩 MA55 后收复</label><br>
+                    <label><input type="checkbox"> 上级别趋势及 MACD 是否衰减</label><br>
+                    <label><input type="checkbox"> 大盘/板块环境（需另行核对）</label>
+                    <p class="helper-text">MA233 是上一级 MA55 的近似参照。触线不等于买点；无固定量比、涨幅或 D+N 门槛。清单为人工练习，不自动评分或下单。</p>
+                </div>
                 <div class="control-section">
                     <h3>账户信息</h3>
                     <div class="account-info">
@@ -356,6 +385,8 @@
                     </div>
                     <div class="chart-actions">
                         <div class="view-period-switch">
+                            <button class="view-period-btn" data-period="15m">15分</button>
+                            <button class="view-period-btn" data-period="60m">60分</button>
                             <button class="view-period-btn active" data-period="daily">日线</button>
                             <button class="view-period-btn" data-period="weekly">周线</button>
                         </div>

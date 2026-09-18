@@ -6531,3 +6531,8 @@ __pycache__/
 *.exe
 *.7z
 chart_render_temp.html
+.venv/
+.pytest_cache/
+/users/
+/runtime/
+!/main_enhanced.py

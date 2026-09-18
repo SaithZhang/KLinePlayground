@@ -78,7 +78,7 @@ def calculate_trade_performance(trade_history):
 class TradeSimulatorEnhanced:
     """增强版交易模拟器，支持持仓汇总、佣金设置、bar ID记录等功能"""
     
-    def __init__(self, user: str, initial_capital: float, stock_code: str):
+    def __init__(self, user: str, initial_capital: float, stock_code: str, users_dir=None):
         self.user = user
         self.stock_code = stock_code
         self.initial_capital = initial_capital
@@ -104,7 +104,8 @@ class TradeSimulatorEnhanced:
         self.trade_history = []
         
         # 数据库连接
-        self.db_path = f'../users/{user}/trade_records.db'
+        users_dir = users_dir or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'users')
+        self.db_path = os.path.join(users_dir, user, 'trade_records.db')
         self._init_database()
     
     def _init_database(self):
@@ -277,7 +278,7 @@ class TradeSimulatorEnhanced:
             merged = False
             if self.trade_history:
                 last_trade = self.trade_history[-1]
-                if last_trade['trade_date'] == trade_date and last_trade['action'] == 'buy':
+                if last_trade['trade_date'] == trade_date and last_trade['bar_id'] == self.current_bar_id and last_trade['action'] == 'buy':
                     # 合并记录
                     old_amount = last_trade['amount']
                     last_trade['quantity'] += quantity
@@ -362,7 +363,7 @@ class TradeSimulatorEnhanced:
             merged = False
             if self.trade_history:
                 last_trade = self.trade_history[-1]
-                if last_trade['trade_date'] == trade_date and last_trade['action'] == 'sell':
+                if last_trade['trade_date'] == trade_date and last_trade['bar_id'] == self.current_bar_id and last_trade['action'] == 'sell':
                     # 合并记录
                     last_trade['quantity'] += quantity
                     last_trade['amount'] += amount

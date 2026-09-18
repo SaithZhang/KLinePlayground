@@ -1,0 +1,3 @@
+# Extend the existing ad-api runtime only to enable its HDF5 factor cache.
+FROM amazingdata-mac:1.1.9-qemu
+RUN /usr/local/bin/qemu-x86_64 /usr/local/bin/python -m pip install --no-cache-dir tables==3.10.2
