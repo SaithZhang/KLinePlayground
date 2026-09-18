@@ -5,6 +5,8 @@ import sys
 import json
 import base64
 import requests
+import time
+import uuid
 from datetime import datetime, timedelta
 import sqlite3
 import pandas as pd
@@ -14,6 +16,8 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from backend.data_manager import DataManager
+from backend.data_jobs import DataJobs, report_progress, progress_reporter
+from backend.data_inventory import inventory
 from backend.kline_processor_enhanced import KLineProcessorEnhanced
 from backend.trade_simulator_enhanced import TradeSimulatorEnhanced
 from backend.user_manager_enhanced import UserManagerEnhanced
@@ -43,6 +47,7 @@ data_manager = DataManager(data_dir=data_dir_path)
 # user_manager = UserManager()
 user_manager = UserManagerEnhanced(users_dir=users_dir_path)
 active_trainings = {}  # 存储活跃的训练会话
+data_jobs = DataJobs(os.path.join(data_dir_path, "operations"))
 
 @app.route('/')
 def index():
@@ -286,19 +291,49 @@ def toggle_api_info():
 
 @app.route('/api/training/start', methods=['POST'])
 def start_training():
-    """开始新的训练"""
+    data = request.get_json() or {}
+    if data.get('background'):
+        def work(ident):
+            with app.app_context():
+                response = _logged_training(data, ident)
+                if response.status_code >= 400:
+                    raise ValueError(response.get_json().get('error', '开局失败'))
+                return response.get_json()
+        ident = data_jobs.start('training', {key: data.get(key) for key in ('data_source', 'period', 'mode', 'practice')}, work)
+        return jsonify({'job_id': ident}), 202
+    ident = uuid.uuid4().hex
+    with progress_reporter(lambda stage, **fields: data_jobs._log(ident, 'TRAINING_STAGE', stage=stage, **fields)):
+        return _logged_training(data, ident)
+
+
+def _logged_training(data, ident):
+    started = time.monotonic()
+    data_jobs._log(ident, 'TRAINING_START', source=data.get('data_source', 'galaxy'),
+                   **{key: data.get(key) for key in ('mode', 'period', 'sector', 'date_start', 'date_end', 'start_date', 'allow_download')})
+    response = app.make_response(_create_training(data))
+    result = response.get_json() or {}
+    data_jobs._log(ident, 'TRAINING_RESULT', status='COMPLETE' if response.status_code < 400 else 'FAILED',
+                   error_code=None if response.status_code < 400 else f'HTTP_{response.status_code}',
+                   stock_code=result.get('stock_code'), start_date=result.get('start_date'),
+                   pool_size=result.get('galaxy_pool_size') if result.get('galaxy_pool_size') is not None else result.get('offline_pool_size'),
+                   elapsed_seconds=round(time.monotonic() - started, 3))
+    return response
+
+
+def _create_training(data):
     try:
-        data = request.get_json()
         user = data.get('user')
         mode = data.get('mode')
-        data_source = data.get('data_source', 'akshare')
+        data_source = data.get('data_source', 'galaxy')
         period = data.get('period', 'daily')
         initial_capital = data.get('initial_capital', 100000)
         practice = data.get('practice', 'free')
         if practice not in {'free', 'ma55'}:
             return jsonify({'error': '未知训练预设'}), 400
         if practice == 'ma55':
-            data_source, period = 'offline', '15m'
+            period = '15m'
+            if data_source not in {'galaxy', 'offline'}:
+                return jsonify({'error': '55 战法需要银河三周期数据，请选择银河或已补齐的本地离线数据'}), 400
         if period not in {'daily', 'weekly', '15m', '60m'}:
             return jsonify({'error': '训练步长支持日线、15 分钟、60 分钟'}), 400
         
@@ -306,7 +341,8 @@ def start_training():
             return jsonify({'error': '用户名不能为空'}), 400
         
         # 创建训练会话
-        training_id = f"{user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        training_id = f"{user}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        user_config = user_manager.get_user_config(user) or {}
         
         if mode == 'random':
             # 随机模式
@@ -320,6 +356,8 @@ def start_training():
                     date_end,
                     source=data_source,
                     interval=period,
+                    exclude_code=user_config.get('last_random_stocks', {}).get(data_source, ''),
+                    allow_download=data.get('allow_download') is True,
                 )
             except ValueError as e:
                 return jsonify({'error': str(e)}), 400
@@ -330,6 +368,13 @@ def start_training():
             
             if not stock_code or not start_date:
                 return jsonify({'error': '股票代码和起始日期不能为空'}), 400
+
+        coverage = []
+        if data_source == 'galaxy':
+            from backend.galaxy_data import prepare_galaxy_training, training_coverage
+            if mode != 'random':
+                prepare_galaxy_training(data_manager, stock_code, start_date)
+            coverage = training_coverage(data_manager, stock_code)
         
         # 验证股票代码和日期
         validation_error = data_manager.get_training_validation_error(
@@ -341,6 +386,7 @@ def start_training():
         if validation_error:
             return jsonify({'error': validation_error}), 400
         
+        report_progress("CALCULATE")
         # 创建增强版K线处理器和交易模拟器
         kline_processor = KLineProcessorEnhanced(data_manager, stock_code, start_date, source=data_source, interval=period)
         if practice == 'ma55':
@@ -356,7 +402,6 @@ def start_training():
         trade_simulator.update_current_price(first_bar['close'], first_bar['bar_id'])
         
         # 获取用户设置并应用到交易模拟器
-        user_config = user_manager.get_user_config(user)
         if user_config and 'settings' in user_config:
             settings = user_config['settings']
             trade_simulator.set_commission_settings(
@@ -380,6 +425,9 @@ def start_training():
         }
         
         _update_api_info(user=user)
+        if mode == 'random' and user_config:
+            user_config.setdefault('last_random_stocks', {})[data_source] = stock_code
+            user_manager.update_user_config(user, user_config)
         
         return jsonify({
             'id': training_id,
@@ -388,6 +436,13 @@ def start_training():
             'mode': mode,
             'data_source': data_source,
             'practice': practice,
+            'coverage': coverage,
+            'galaxy_pool_size': len(data_manager.get_cached_galaxy_candidates(
+                data.get('sector', 'all'), data.get('date_start', '2024-01-01'), data.get('date_end', '2026-01-01')
+            )) if mode == 'random' and data_source == 'galaxy' and data.get('allow_download') is not True else None,
+            'offline_pool_size': len(data_manager._filter_stock_codes_by_sector(
+                data_manager._get_offline_stock_codes(period), data.get('sector', 'all')
+            )) if mode == 'random' and data_source == 'offline' else None,
             'adjustment_mode': kline_processor.adjustment_mode,
             'period': period
         })
@@ -857,7 +912,7 @@ def get_stock_universe():
     """按市场返回股票代码列表，供批量补数使用。"""
     try:
         market = request.args.get('market', 'all')
-        stock_codes = data_manager.get_stock_universe(market=market)
+        stock_codes = data_manager.get_stock_universe(market=market, source=request.args.get('source', 'galaxy'))
         return jsonify({
             'market': market,
             'count': len(stock_codes),
@@ -865,6 +920,61 @@ def get_stock_universe():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/data/inventory', methods=['GET'])
+def get_data_inventory():
+    try:
+        result = inventory(data_manager, request.args.get('date_start', '2020-09-19'),
+                           request.args.get('date_end', str(pd.Timestamp.now().date())), request.args.get('sector', 'all'))
+        return jsonify(result)
+    except (ValueError, OSError) as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/data/jobs', methods=['GET', 'POST'])
+def sync_jobs():
+    if request.method == 'GET':
+        return jsonify({'jobs': data_jobs.history()})
+    config = request.get_json() or {}
+    config.setdefault('scope', 'single')
+    config.setdefault('interval', 'daily')
+    if config.get('scope', 'single') not in {'single', 'all', 'sh', 'sz'}:
+        return jsonify({'error': '未知补数范围'}), 400
+    if config.get('source') not in {'galaxy', 'akshare', 'xtdata', 'mootdx'}:
+        return jsonify({'error': '请选择有效数据源'}), 400
+    if config.get('interval', 'daily') not in {'daily', '15m', '60m', 'all'}:
+        return jsonify({'error': '未知补数周期'}), 400
+    if config.get('source') != 'galaxy' and config.get('interval', 'daily') != 'daily':
+        return jsonify({'error': '分钟线与三周期补数请选择银河'}), 400
+    if config.get('scope', 'single') == 'single' and not config.get('stock_code'):
+        return jsonify({'error': '请输入股票代码'}), 400
+    try:
+        start, end = data_manager._normalize_sync_range(config.get('start_date'), config.get('end_date'))
+        config.update(start_date=str(start.date()), end_date=str(end.date()))
+        # Store only form fields; never arbitrary client configuration or credentials.
+        config = {key: config.get(key) for key in ('scope', 'source', 'stock_code', 'start_date', 'end_date', 'interval', 'force_full')}
+        ident = data_jobs.start('sync', config, lambda job: data_jobs.run_sync(job, data_manager, config))
+        return jsonify({'job_id': ident}), 202
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/data/jobs/<ident>', methods=['GET'])
+def get_data_job(ident):
+    try:
+        return jsonify(data_jobs.get(ident, full=request.args.get('full') == '1'))
+    except KeyError:
+        return jsonify({'error': '任务不存在'}), 404
+
+
+@app.route('/api/data/jobs/<ident>/stop', methods=['POST'])
+def stop_data_job(ident):
+    try:
+        data_jobs.stop(ident)
+        return jsonify({'message': '已请求停止：当前股票结束后不再请求下一只。'})
+    except (KeyError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
+
 
 @app.route('/api/data/sync', methods=['POST'])
 def sync_offline_data():

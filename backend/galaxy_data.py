@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from backend import galaxy_runtime
+from backend.data_jobs import report_progress
 
 PERIODS = ("daily", "15m", "60m")
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,7 @@ def stop_runtime(run, mode, command, env):
 
 
 def query_galaxy(code, start, end, periods):
+    report_progress('RUNTIME')
     mode, executable, env = galaxy_runtime.launch_spec()
     runtime = ROOT / "data" / "galaxy_requests"
     runtime.mkdir(parents=True, exist_ok=True)
@@ -58,7 +60,8 @@ def query_galaxy(code, start, end, periods):
         calendar_path = ROOT / "data" / "galaxy_calendar.json"
         if calendar_path.is_file():
             calendar = json.loads(calendar_path.read_text(encoding="utf-8"))
-            if calendar["start"] <= body["start"] and calendar["end"] >= body["end"]:
+            if (calendar.get("full") and calendar.get("as_of") == pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d")
+                    and calendar["start"] <= body["start"] and calendar["end"] >= body["end"]):
                 body["calendar"] = [int(day) for day in calendar["dates"]]
         request.write_text(json.dumps(body), encoding="utf-8")
         command = [executable, str(ROOT / "scripts" / "galaxy_worker.py"), str(request), str(output)]
@@ -80,6 +83,7 @@ def query_galaxy(code, start, end, periods):
                     observed_stage = stage_path.read_text(encoding="utf-8") if stage_path.exists() else stage
                     if observed_stage and observed_stage != stage:
                         stage, last_progress = observed_stage, time.monotonic()
+                        report_progress(stage)
                     if time.monotonic() - last_progress > 180 or time.monotonic() - started > 480:
                         raise
         except subprocess.TimeoutExpired:
@@ -92,11 +96,18 @@ def query_galaxy(code, start, end, periods):
                     return partial
             raise ValueError(f"银河查询 {stage} 超时（单阶段 180 秒/整次 480 秒）；本地文件未改动，请缩短区间后手动重试") from None
         if run.returncode or not output.is_file():
-            raise ValueError("银河运行失败；请检查原生 SDK/Python 或 Docker skill，以及银河凭据配置")
+            stage = stage_path.read_text(encoding="utf-8") if stage_path.is_file() else stage
+            raise ValueError(f"银河运行失败（阶段 {stage}，退出码 {run.returncode}）；请检查原生 SDK/Python 或 Docker skill")
         result = json.loads(output.read_text(encoding="utf-8"))
         if result.get("error"):
+            report_progress('SOURCE_ERROR', error_code=result['error'], error_location=result.get('error_location'))
             raise ValueError(result["error"] + "；本地文件未改动")
-        if result.get("calendar") and "calendar" not in body:
+        if result.get("sdk_calendar"):
+            dates = result["sdk_calendar"]
+            calendar_path.write_text(json.dumps({"start": min(dates), "end": max(dates), "dates": dates,
+                "source": "galaxy", "full": True,
+                "as_of": pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d")}), encoding="utf-8")
+        elif result.get("calendar") and "calendar" not in body:
             calendar_path.write_text(json.dumps({"start": body["start"], "end": body["end"],
                                                 "dates": result["calendar"], "source": "galaxy"}), encoding="utf-8")
         return result
@@ -140,6 +151,103 @@ def validate_rows(rows, factors, start, end, period, timestamp_semantics="start"
     return frame.sort_values("date").reset_index(drop=True)
 
 
+def galaxy_stock_codes(manager):
+    """Galaxy's current A-share universe, cached daily; never use a public-source list."""
+    path = Path(manager.data_dir) / "galaxy_universe.json"
+    today = pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d")
+    with SYNC_LOCK:
+        cached = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if cached.get("as_of") != today:
+            report_progress('UNIVERSE')
+            result = query_galaxy(None, pd.Timestamp(today), pd.Timestamp(today), [])
+            codes = sorted({code.split(".")[0] for code in result.get("codes", [])
+                            if re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code)})
+            if not codes:
+                raise ValueError("银河股票列表为空，未切换到其他数据源")
+            cached = {"source": "galaxy", "as_of": today, "codes": codes}
+            path.write_text(json.dumps(cached), encoding="utf-8")
+    return cached["codes"]
+
+
+def training_coverage(manager, stock_code):
+    coverage = []
+    for period in PERIODS:
+        path = Path(manager._get_galaxy_file(stock_code, period)).with_suffix(".receipt.json")
+        receipt = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        coverage.append({"period": period, "status": receipt.get("status", "UNKNOWN"),
+                         "missing_count": len(receipt.get("missing_bars", []))})
+    return coverage
+
+
+def cached_training_dates(manager, stock_code):
+    """Eligible local trading days, memoized until any of the three files changes."""
+    paths = [Path(manager._get_galaxy_file(stock_code, period)) for period in PERIODS]
+    if not all(path.is_file() for path in paths):
+        return pd.DatetimeIndex([])
+    signature = tuple((path.stat().st_mtime_ns, path.stat().st_size) for path in paths)
+    cached = manager._galaxy_training_dates_cache.get(stock_code)
+    if cached and cached[0] == signature:
+        return cached[1]
+    common_days = None
+    warmup_end = pd.Timestamp.min
+    try:
+        for path in paths:
+            frame = pd.read_csv(path, usecols=["date", "factor"], parse_dates=["date"])
+            if (len(frame) < 235 or frame.date.isna().any() or frame.date.duplicated().any()
+                    or not np.isfinite(frame.factor).all() or (frame.factor <= 0).any()):
+                return pd.DatetimeIndex([])
+            dates = pd.DatetimeIndex(frame.date).sort_values()
+            warmup_end = max(warmup_end, dates[232].normalize())
+            days = dates.normalize().unique()
+            common_days = days if common_days is None else common_days.intersection(days)
+    except (ValueError, OSError, TypeError):
+        return pd.DatetimeIndex([])
+    # At least 233 completed historical bars and another shared trading day ahead.
+    eligible = common_days.sort_values()[:-1]
+    eligible = eligible[eligible > warmup_end]
+    manager._galaxy_training_dates_cache[stock_code] = (signature, eligible)
+    return eligible
+
+
+def prepare_galaxy_training(manager, stock_code, start_date):
+    """Download one bounded episode with MA233 history and all three chart periods."""
+    start = pd.Timestamp(start_date).normalize()
+    report_progress('CACHE_CHECK', stock_code=stock_code)
+    now = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None)
+    latest = pd.offsets.BDay().rollback(now.normalize() - pd.Timedelta(days=int(now.hour < 16)))
+    if start < pd.Timestamp("2015-01-01") or start >= latest:
+        raise ValueError("银河训练起点须在 2015-01-01 之后，且早于最近已收盘日期")
+    end = min(start + pd.Timedelta(days=90), latest)
+    ready = True
+    coverage = []
+    for period in PERIODS:
+        frame = manager.get_stock_data(stock_code, source="galaxy", interval=period)
+        path = manager._get_galaxy_file(stock_code, period)
+        receipt_path = Path(path).with_suffix(".receipt.json")
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path.is_file() else {}
+        if (frame is None or len(frame[frame.date < start]) < 233
+                or len(frame[frame.date >= start]) < 2):
+            ready = False
+        coverage.append({"period": period, "status": receipt.get("status", "UNKNOWN"),
+                         "missing_count": len(receipt.get("missing_bars", []))})
+    if not ready:
+        report_progress('CACHE_MISS', stock_code=stock_code, reason='三周期历史或后续行情不足，开始下载')
+        result = sync_galaxy(manager, stock_code, str((start - pd.Timedelta(days=550)).date()),
+                             str(end.date()), "all")
+        coverage = [{"period": item["period"], "status": item["status"],
+                     "missing_count": len(item.get("missing_bars", []))} for item in result["periods"]]
+        if any(item["status"] == "FAILED" for item in coverage):
+            raise ValueError("银河三周期准备失败，未使用旧文件或其他数据源开局；请在补数面板检查后重试")
+    else:
+        report_progress('CACHE_HIT')
+    # Do not start an empty/brand-new listing episode or invent an MA warmup.
+    for period in PERIODS:
+        frame = manager.get_stock_data(stock_code, source="galaxy", interval=period)
+        if frame is None or len(frame[frame.date < start]) < 233 or len(frame[frame.date >= start]) < 2:
+            raise ValueError("抽取区间的银河历史不足 MA233 或后续训练，请重新抽取或调整日期范围")
+    return coverage
+
+
 def expected_times(period):
     if period == "daily":
         return ["00:00"]
@@ -166,9 +274,11 @@ def sync_galaxy(manager, stock_code, start_date, end_date, interval="daily", for
     symbol = manager._format_xt_code(code)
     periods = list(PERIODS) if interval == "all" else [interval]
     results = []
+    report_progress('WAITING', stock_code=stock_code)
     with SYNC_LOCK:
         payload = query_galaxy(symbol, start, end, periods)
         for period in periods:
+            report_progress('VALIDATE_' + period)
             directory = Path(manager.offline_dir) / "galaxy" / period
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / f"{symbol}.csv"
@@ -209,8 +319,12 @@ def sync_galaxy(manager, stock_code, start_date, end_date, interval="daily", for
             except (ValueError, KeyError, TypeError) as exc:
                 result.update(status="FAILED", success=False, error=str(exc))
             receipt = path.with_suffix(".receipt.json")
-            receipt.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            receipt_temp = receipt.with_suffix('.json.tmp')
+            receipt_temp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(receipt_temp, receipt)
             results.append(result)
+            report_progress('SAVED_' + period, period=period, period_status=result['status'],
+                            fetched_rows=result['fetched_rows'], missing_count=len(result.get('missing_bars', [])))
         manager._offline_stock_codes_cache = None
         manager._offline_date_range_cache.clear()
     success = all(item["success"] for item in results)

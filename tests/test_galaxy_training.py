@@ -186,7 +186,7 @@ def test_tplus_one_and_separate_minute_trade_records(tmp_path):
     assert simulator.sell(1, 11, "2026-09-18")["success"]
 
 
-def test_api_ma55_preset_and_context(histories, tmp_path, monkeypatch):
+def test_api_ma55_preset_and_context(histories, tmp_path, monkeypatch, api_operations):
     from backend import app_enhanced as api
     from backend.user_manager_enhanced import UserManagerEnhanced
     monkeypatch.setattr(api, "data_manager", histories)
@@ -196,7 +196,7 @@ def test_api_ma55_preset_and_context(histories, tmp_path, monkeypatch):
     monkeypatch.setattr(api, "_update_api_info", lambda **kwargs: None)
     client = api.app.test_client()
     response = client.post("/api/training/start", json={"user": "test", "mode": "specified",
-                           "stock_code": "603938", "start_date": "2026-09-15", "practice": "ma55"})
+                           "stock_code": "603938", "start_date": "2026-09-15", "practice": "ma55", "data_source": "offline"})
     assert response.status_code == 200, response.json
     session = response.json
     assert session["period"] == "15m"
@@ -254,3 +254,212 @@ def test_runtime_timeout_stops_only_its_own_container(tmp_path, monkeypatch):
         galaxy_data.query_galaxy("603938.SH", pd.Timestamp("2026-09-17"), pd.Timestamp("2026-09-18"), ["daily"])
     assert len(killed) == 1
     assert [args[-1] for args in calls if args[1] == "stop"] == ["ours"]
+
+
+def test_galaxy_source_never_reads_public_archive(manager):
+    legacy = Path(manager.offline_dir) / '603938.SH.csv'
+    frame(['2026-09-17']).to_csv(legacy, index=False)
+    assert manager.get_stock_data('603938', 'galaxy') is None
+    assert manager.get_factor_data('603938', 'galaxy') is None
+
+
+@pytest.mark.parametrize('period', ['daily', '15m', '60m'])
+def test_galaxy_training_source_round_trip(histories, period):
+    bars = histories.get_stock_data('603938', 'galaxy', period)
+    factors = histories.get_factor_data('603938', 'galaxy', period)
+    assert len(bars) == len(factors) > 233
+    processor = KLineProcessorEnhanced(histories, '603938', '2026-09-15', 'galaxy', period)
+    assert processor.get_ma_data([55, 233], view_period=period)[233]
+    before = processor.get_progress()['current_bar_id']
+    assert processor.next_bar()
+    assert processor.get_progress()['current_bar_id'] == before + 1
+
+
+def test_galaxy_universe_cache_is_source_owned(manager, monkeypatch):
+    import json
+    calls = []
+    def query(*args):
+        calls.append(args)
+        return {'codes': ['603938.SH', '000001.SZ', '000001.SZ', 'invalid', 'not-a-stock']}
+    monkeypatch.setattr(galaxy_data, 'query_galaxy', query)
+    assert galaxy_data.galaxy_stock_codes(manager) == ['000001', '603938']
+    assert galaxy_data.galaxy_stock_codes(manager) == ['000001', '603938']
+    assert len(calls) == 1
+    assert calls[0][0] is None
+    assert json.loads((Path(manager.data_dir) / 'galaxy_universe.json').read_text())['source'] == 'galaxy'
+
+
+def test_cached_episode_reuses_three_periods_and_reports_gaps(histories, monkeypatch):
+    import json
+    for period in galaxy_data.PERIODS:
+        path = Path(histories._get_galaxy_file('603938', period)).with_suffix('.receipt.json')
+        path.write_text(json.dumps({'status': 'PARTIAL', 'missing_bars': ['2026-07-01'],
+                                   'requested_range': {'end': '2099-01-01'}}))
+    def no_network(*args):
+        pytest.fail('a covered episode must not redownload')
+    monkeypatch.setattr(galaxy_data, 'query_galaxy', no_network)
+    coverage = galaxy_data.prepare_galaxy_training(histories, '603938', '2026-09-01')
+    assert all(item['status'] == 'PARTIAL' and item['missing_count'] == 1 for item in coverage)
+
+
+def test_failed_galaxy_prepare_does_not_start_using_old_cache(histories, monkeypatch):
+    monkeypatch.setattr(galaxy_data, 'sync_galaxy', lambda *args: {
+        'periods': [{'period': p, 'status': 'FAILED'} for p in galaxy_data.PERIODS]})
+    with pytest.raises(ValueError, match='未使用旧文件'):
+        galaxy_data.prepare_galaxy_training(histories, '603938', '2025-02-01')
+
+
+@pytest.fixture
+def blind_client(histories, tmp_path, monkeypatch, api_operations):
+    import shutil
+    from backend import app_enhanced as api
+    from backend import data_manager as dm
+    from backend.user_manager_enhanced import UserManagerEnhanced
+    for period in galaxy_data.PERIODS:
+        shutil.copy(histories._get_galaxy_file('603938', period), histories._get_galaxy_file('000001', period))
+    monkeypatch.setattr(dm, 'galaxy_stock_codes', lambda manager: ['603938', '000001'])
+    monkeypatch.setattr(dm, 'prepare_galaxy_training', lambda *args: [])
+    monkeypatch.setattr(galaxy_data, 'prepare_galaxy_training', lambda *args: [])
+    monkeypatch.setattr(dm.random, 'choice', lambda items: items[0])
+    monkeypatch.setattr(api, 'data_manager', histories)
+    monkeypatch.setattr(api, 'users_dir_path', str(tmp_path / 'users'))
+    users = UserManagerEnhanced(str(tmp_path / 'users'))
+    users.create_user('blind-test')
+    monkeypatch.setattr(api, 'user_manager', users)
+    monkeypatch.setattr(api, 'active_trainings', {})
+    monkeypatch.setattr(api, '_update_api_info', lambda **kwargs: None)
+    return api.app.test_client()
+
+
+@pytest.mark.parametrize('period', ['daily', '15m', '60m'])
+def test_blind_api_changes_stock_and_preserves_source(blind_client, period):
+    config = {'user': 'blind-test', 'mode': 'random', 'data_source': 'galaxy', 'period': period,
+              'date_start': '2026-09-01', 'date_end': '2026-09-02'}
+    first = blind_client.post('/api/training/start', json=config)
+    second = blind_client.post('/api/training/start', json=config)
+    assert first.status_code == second.status_code == 200, (first.json, second.json)
+    assert first.json['stock_code'] != second.json['stock_code']
+    assert first.json['id'] != second.json['id']
+    assert second.json['data_source'] == 'galaxy'
+    assert second.json['period'] == period
+    for view in ('daily', '15m', '60m'):
+        reply = blind_client.get(f'/api/training/{second.json["id"]}/data?view_period={view}&ma_periods=55,233')
+        assert reply.status_code == 200
+        assert reply.json['kline_data'] and reply.json['ma_data']['233']
+
+
+def test_ma55_never_silently_overrides_akshare(blind_client):
+    response = blind_client.post('/api/training/start', json={
+        'user': 'blind-test', 'mode': 'random', 'practice': 'ma55', 'data_source': 'akshare'})
+    assert response.status_code == 400
+    assert '请选择银河' in response.json['error']
+    response = blind_client.post('/api/training/start', json={
+        'user': 'blind-test', 'mode': 'random', 'practice': 'ma55', 'data_source': 'galaxy',
+        'date_start': '2026-09-01', 'date_end': '2026-09-02'})
+    assert response.status_code == 200, response.json
+    assert response.json['data_source'] == 'galaxy'
+    assert response.json['period'] == '15m'
+
+
+def test_offline_pool_excludes_previous_stock(histories, monkeypatch):
+    import shutil
+    from backend import data_manager as dm
+    shutil.copy(histories._get_galaxy_file('603938'), histories._get_galaxy_file('000001'))
+    monkeypatch.setattr(dm.random, 'choice', lambda items: items[0])
+    code, _ = histories.get_random_stock(date_start='2026-09-01', date_end='2026-09-02',
+                                         source='offline', exclude_code='000001')
+    assert code == '603938'
+
+
+def test_worker_reuses_full_calendar_for_factors(tmp_path, monkeypatch):
+    import json
+    import sys
+    from types import SimpleNamespace
+    from scripts import galaxy_worker
+    calls = []
+    full_calendar = [20130104, 20260917, 20260918]
+    class Base:
+        def get_calendar(self):
+            calls.append('calendar_network')
+            return full_calendar
+        def get_backward_factor(self, codes, **kwargs):
+            assert self.get_calendar(symbol='SH') == full_calendar
+            return pd.DataFrame({codes[0]: [1., 2.]}, index=pd.to_datetime(['2026-09-17', '2026-09-18']))
+    monkeypatch.setitem(sys.modules, 'AmazingData', SimpleNamespace(
+        login=lambda **kwargs: None, BaseData=Base, MarketData=lambda days: None))
+    for name in ('AD_USERNAME', 'AD_PASSWORD', 'AD_HOST'):
+        monkeypatch.setenv(name, 'synthetic')
+    monkeypatch.setenv('AD_PORT', '8600')
+    monkeypatch.setenv('AD_CACHE_DIR', str(tmp_path / 'cache'))
+    request, output = tmp_path / 'request.json', tmp_path / 'output.json'
+    request.write_text(json.dumps({'code': '000001.SZ', 'start': '20260917', 'end': '20260918', 'periods': []}))
+    galaxy_worker.main(str(request), str(output))
+    result = json.loads(output.read_text())
+    assert 'error' not in result, result
+    assert calls == ['calendar_network']
+    assert result['sdk_calendar'] == ['20130104', '20260917', '20260918']
+    assert result['calendar'] == ['20260917', '20260918']
+
+
+def test_local_blind_mode_never_calls_provider(blind_client, monkeypatch):
+    from backend import data_manager as dm
+    def forbidden(*args, **kwargs):
+        pytest.fail('cached blind mode must not call any online preparation')
+    monkeypatch.setattr(dm, 'galaxy_stock_codes', forbidden)
+    monkeypatch.setattr(dm, 'prepare_galaxy_training', forbidden)
+    monkeypatch.setattr(galaxy_data, 'query_galaxy', forbidden)
+    response = blind_client.post('/api/training/start', json={
+        'user': 'blind-test', 'mode': 'random', 'practice': 'ma55', 'data_source': 'galaxy',
+        'date_start': '2026-09-01', 'date_end': '2026-09-02'})
+    assert response.status_code == 200, response.json
+    assert response.json['galaxy_pool_size'] == 2
+    data = blind_client.get(f'/api/training/{response.json["id"]}/data?view_period=15m&ma_periods=55,233')
+    assert data.status_code == 200
+    assert data.json['ma_data']['233']
+
+
+def test_empty_local_pool_fails_without_network(manager, monkeypatch):
+    from backend import data_manager as dm
+    monkeypatch.setattr(dm, 'galaxy_stock_codes', lambda *args: pytest.fail('must stay local'))
+    with pytest.raises(ValueError, match='本次未联网'):
+        manager.get_random_stock(source='galaxy')
+
+
+def test_cached_dates_require_three_periods_warmup_and_future(histories):
+    dates = galaxy_data.cached_training_dates(histories, '603938')
+    assert len(dates) > 0
+    for period in galaxy_data.PERIODS:
+        bars = histories.get_stock_data('603938', 'galaxy', period)
+        assert len(bars[bars.date < dates[0]]) >= 233
+        assert len(bars[bars.date >= dates[-1]]) >= 2
+    assert dates[-1] < pd.Timestamp('2026-09-18')
+    # A rewritten file invalidates the local eligibility cache.
+    archive(histories, '60m', frame(['2026-09-01 10:30']))
+    assert len(galaxy_data.cached_training_dates(histories, '603938')) == 0
+
+
+def test_ready_archive_does_not_require_ninety_future_days_or_latest_receipt(histories, monkeypatch):
+    import json
+    for period in galaxy_data.PERIODS:
+        Path(histories._get_galaxy_file('603938', period)).with_suffix('.receipt.json').write_text(json.dumps({
+            'status': 'PARTIAL', 'missing_bars': ['2026-07-01'], 'requested_range': {'end': '2026-08-01'}}))
+    monkeypatch.setattr(galaxy_data, 'query_galaxy', lambda *args: pytest.fail('already has usable data'))
+    coverage = galaxy_data.prepare_galaxy_training(histories, '603938', '2026-09-01')
+    assert all(item['status'] == 'PARTIAL' for item in coverage)
+
+
+def test_full_market_download_requires_explicit_choice(histories, monkeypatch):
+    from backend import data_manager as dm
+    calls = []
+    monkeypatch.setattr(dm, 'galaxy_stock_codes', lambda *args: ['603938'])
+    monkeypatch.setattr(dm, 'prepare_galaxy_training', lambda *args: calls.append('prepare'))
+    code, _ = histories.get_random_stock(source='galaxy', date_start='2026-09-01', date_end='2026-09-02',
+                                         allow_download=True)
+    assert code == '603938' and calls == ['prepare']
+
+
+def test_cached_stock_name_does_not_fetch_missing_public_list(manager, monkeypatch):
+    import json
+    Path(manager.data_dir, 'stock_names.json').write_text(json.dumps({'000001': '平安银行'}))
+    monkeypatch.setattr(manager, 'load_stock_list', lambda: pytest.fail('name lookup must stay local'))
+    assert manager.get_stock_name('000001') == '平安银行'

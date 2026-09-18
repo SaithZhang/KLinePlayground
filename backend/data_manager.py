@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import akshare as ak
 import pandas as pd
 
-from backend.galaxy_data import sync_galaxy
+from backend.galaxy_data import sync_galaxy, galaxy_stock_codes, prepare_galaxy_training, cached_training_dates
 from backend.galaxy_runtime import runtime_status
 
 try:
@@ -45,6 +45,7 @@ class DataManager:
         self.stock_names: Dict[str, str] = {}
         self._offline_stock_codes_cache: Optional[List[str]] = None
         self._offline_date_range_cache: Dict[str, Optional[Tuple[pd.Timestamp, pd.Timestamp]]] = {}
+        self._galaxy_training_dates_cache = {}
 
     def download_stock_list(self) -> bool:
         """下载 A 股股票列表。"""
@@ -87,11 +88,11 @@ class DataManager:
         return [
             {
                 "value": "galaxy",
-                "label": "银河 AmazingData（补数）",
+                "label": "银河 AmazingData（推荐）",
                 "kind": "online",
                 "supports_incremental_sync": True,
                 "supports_factor": True,
-                "sync_only": True,
+                "sync_only": False,
                 **runtime_status(),
             },
             {
@@ -101,7 +102,7 @@ class DataManager:
                 "kind": "online",
                 "supports_incremental_sync": True,
                 "supports_factor": True,
-                "description": "免费公网源，默认推荐。",
+                "description": "免费公网日线源。",
             },
             {
                 "value": "xtdata",
@@ -157,6 +158,11 @@ class DataManager:
         if not digits:
             return ""
         return digits[-6:].zfill(6)
+
+    def _get_galaxy_file(self, stock_code, interval="daily"):
+        code = self._normalize_stock_code(stock_code)
+        period = "daily" if interval == "weekly" else interval
+        return os.path.join(self.offline_dir, "galaxy", period, self._format_xt_code(code) + ".csv")
 
     def _get_offline_file(self, stock_code: str, interval: str = "daily") -> Optional[str]:
         stock_code = self._normalize_stock_code(stock_code)
@@ -375,20 +381,20 @@ class DataManager:
             return None
         return data["date"].min(), data["date"].max()
 
-    def get_stock_universe(self, market: str = "all") -> List[str]:
+    def get_stock_universe(self, market: str = "all", source: str = "akshare") -> List[str]:
+        if source == 'galaxy':
+            codes = galaxy_stock_codes(self)
+            if market == 'sh':
+                return [code for code in codes if self._get_market_suffix(code) == '.SH']
+            if market == 'sz':
+                return [code for code in codes if self._get_market_suffix(code) == '.SZ']
+            return codes
         if self.stock_list is None:
             self.load_stock_list()
 
         market_key = (market or "all").lower()
         if self.stock_list is None or self.stock_list.empty:
-            stock_codes = self._get_offline_stock_codes()
-            if market_key == "sh":
-                return [code for code in stock_codes if code.startswith(("60", "68", "69"))]
-            if market_key == "sz":
-                return [code for code in stock_codes if code.startswith(("00", "001", "002", "003", "30"))]
-            if market_key == "bj":
-                return [code for code in stock_codes if code.startswith(("43", "83", "87", "92"))]
-            return stock_codes
+            raise ValueError('全市场股票列表获取失败，未开始补数；不会将本地少量股票冒充全市场。')
 
         stock_codes = self.stock_list["code"].dropna().astype(str).str.zfill(6)
         if market_key == "sh":
@@ -940,12 +946,12 @@ class DataManager:
         stock_code = self._normalize_stock_code(stock_code)
         if interval not in {"daily", "weekly", "15m", "60m"}:
             raise ValueError("不支持的 K 线周期")
-        if source != "offline" and interval in {"15m", "60m"}:
-            raise ValueError("分钟训练请先用银河补数，再选择本地离线数据")
+        if source not in {"offline", "galaxy"} and interval in {"15m", "60m"}:
+            raise ValueError("分钟训练请选择银河或本地离线数据")
         try:
-            if source == "offline":
-                offline_path = self._get_offline_file(stock_code, interval)
-                if not offline_path:
+            if source in {"offline", "galaxy"}:
+                offline_path = self._get_galaxy_file(stock_code, interval) if source == "galaxy" else self._get_offline_file(stock_code, interval)
+                if not offline_path or not os.path.isfile(offline_path):
                     return None
                 data = self._read_csv_with_fallback(offline_path)
                 normalized = self._normalize_offline_data(data)
@@ -978,12 +984,12 @@ class DataManager:
         stock_code = self._normalize_stock_code(stock_code)
         if interval not in {"daily", "weekly", "15m", "60m"}:
             raise ValueError("不支持的 K 线周期")
-        if source != "offline" and interval in {"15m", "60m"}:
-            raise ValueError("分钟训练请先用银河补数，再选择本地离线数据")
+        if source not in {"offline", "galaxy"} and interval in {"15m", "60m"}:
+            raise ValueError("分钟训练请选择银河或本地离线数据")
         try:
-            if source == "offline":
-                offline_path = self._get_offline_file(stock_code, interval)
-                if not offline_path:
+            if source in {"offline", "galaxy"}:
+                offline_path = self._get_galaxy_file(stock_code, interval) if source == "galaxy" else self._get_offline_file(stock_code, interval)
+                if not offline_path or not os.path.isfile(offline_path):
                     return None
                 data = self._read_csv_with_fallback(offline_path)
                 normalized = self._normalize_offline_data(data)
@@ -1017,8 +1023,13 @@ class DataManager:
 
     def get_stock_name(self, stock_code: str) -> str:
         stock_code = self._normalize_stock_code(stock_code)
-        if not self.stock_names and os.path.exists(os.path.join(self.data_dir, "stock_names.json")):
-            self.load_stock_list()
+        names_path = os.path.join(self.data_dir, "stock_names.json")
+        if not self.stock_names and os.path.exists(names_path):
+            try:
+                with open(names_path, encoding="utf-8") as file:
+                    self.stock_names = json.load(file)
+            except (OSError, ValueError):
+                pass
         return self.stock_names.get(stock_code, f"股票{stock_code}")
 
     def get_training_validation_error(
@@ -1069,6 +1080,17 @@ class DataManager:
             interval=interval,
         ) is None
 
+    def get_cached_galaxy_candidates(self, sector, date_start, date_end):
+        range_start, range_end = self._resolve_training_range(date_start, date_end)
+        codes = self._filter_stock_codes_by_sector(self._get_offline_stock_codes(), sector)
+        candidates = []
+        for code in codes:
+            dates = cached_training_dates(self, code)
+            dates = dates[(dates >= range_start) & (dates <= range_end)]
+            if len(dates):
+                candidates.append((code, dates))
+        return candidates
+
     def get_random_stock(
         self,
         sector: str = "all",
@@ -1076,9 +1098,39 @@ class DataManager:
         date_end: str = "2026-01-01",
         source: str = "akshare",
         interval: str = "daily",
+        exclude_code: str = "",
+        allow_download: bool = False,
     ) -> Tuple[str, str]:
         """随机选择股票与起始日期。"""
         range_start, range_end = self._resolve_training_range(date_start, date_end)
+
+        if source == "galaxy":
+            if not allow_download:
+                candidates = self.get_cached_galaxy_candidates(sector, date_start, date_end)
+                if not candidates:
+                    raise ValueError("已下载的银河数据中没有符合板块、日期和三周期 MA233 预热条件的样本。"
+                                     "本次未联网；请调整范围、提前补数，或选择全市场抽取下载。")
+                choices = [item for item in candidates if item[0] != exclude_code] or candidates
+                code, dates = random.choice(choices)
+                return code, random.choice(dates).strftime("%Y-%m-%d")
+            codes = self._filter_stock_codes_by_sector(galaxy_stock_codes(self), sector)
+            choices = [code for code in codes if code != exclude_code] or codes
+            if not choices:
+                raise ValueError("银河股票列表中没有符合板块的股票")
+            now = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).normalize()
+            range_start = max(range_start, pd.Timestamp("2015-01-01"))
+            range_end = min(range_end, now - pd.Timedelta(days=7))
+            if range_start > range_end:
+                raise ValueError("银河盲盒日期须在 2015 年之后且至少留出一周后续行情")
+            code = random.choice(choices)
+            start = self._random_date_in_range(range_start, range_end)
+            prepare_galaxy_training(self, code, start)
+            bars = self.get_stock_data(code, source="galaxy", interval=interval)
+            eligible = bars[(bars.date.dt.normalize() >= pd.Timestamp(start)) &
+                            (bars.date.dt.normalize() <= range_end)]
+            if eligible.empty:
+                raise ValueError("抽取日期范围内没有可用交易日，请重新抽取")
+            return code, str(eligible.date.iloc[0].date())
 
         if source == "offline":
             stock_codes = self._filter_stock_codes_by_sector(self._get_offline_stock_codes(interval), sector)
@@ -1097,6 +1149,7 @@ class DataManager:
             if not candidates:
                 raise ValueError("离线数据中没有符合板块与日期范围的股票")
 
+            candidates = [item for item in candidates if item[0] != exclude_code] or candidates
             stock_code, available_start, available_end = random.choice(candidates)
             return stock_code, self._random_date_in_range(available_start, available_end)
 
@@ -1111,6 +1164,7 @@ class DataManager:
         if not stock_codes:
             raise ValueError("所选板块下没有可用股票")
 
+        stock_codes = [code for code in stock_codes if code != exclude_code] or stock_codes
         random.shuffle(stock_codes)
         max_attempts = min(len(stock_codes), 80)
         for stock_code in stock_codes[:max_attempts]:

@@ -1298,3 +1298,15 @@ body[data-theme="dark"] .chip-current-line {
         min-height: 560px;
     }
 }
+
+/* Local data evidence stays readable on desktop and narrow embedded windows. */
+#inventory-modal { z-index: 2100; }
+.inventory-content { width: min(1200px, 94vw); max-width: 1200px; }
+.inventory-table-wrap { overflow-x: auto; max-height: 52vh; }
+.inventory-table { width: 100%; border-collapse: collapse; min-width: 850px; font-size: 13px; }
+.inventory-table th, .inventory-table td { padding: 12px; border-bottom: 1px solid var(--border-color, #ddd); text-align: left; vertical-align: top; white-space: pre-line; }
+.inventory-table details { margin-top: 8px; }
+#inventory-environment { overflow-wrap: anywhere; }
+#sync-history { display: grid; gap: 8px; margin-top: 12px; }
+#sync-result { max-height: 32vh; overflow: auto; white-space: pre-wrap; }
+#sync-stage-progress, #loading-progress { width: 100%; height: 8px; margin: 12px 0; accent-color: #3478f6; }

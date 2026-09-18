@@ -566,6 +566,7 @@ async function loadDataSources() {
         availableDataSources = payload.sources || [];
         hydrateDataSourceSelect('data-source', true);
         hydrateDataSourceSelect('sync-source', false);
+        updateGalaxyPoolControl();
     } catch (error) {
         console.error('加载数据源列表失败:', error);
     }
@@ -575,7 +576,7 @@ function hydrateDataSourceSelect(selectId, includeOffline = false) {
     const select = document.getElementById(selectId);
     if (!select) return;
 
-    const currentValue = select.value;
+    const currentValue = includeOffline ? (localStorage.getItem('trainingDataSource') || 'galaxy') : select.value;
     const options = availableDataSources.filter((item) => includeOffline ? !item.sync_only : item.value !== 'offline');
     if (options.length === 0) return;
 
@@ -663,11 +664,22 @@ function setupEventListeners() {
     document.getElementById('new-training-btn').addEventListener('click', showTrainingSetup);
     document.getElementById('cancel-setup-btn').addEventListener('click', hideTrainingSetup);
     document.getElementById('start-training-btn').addEventListener('click', startTraining);
+    document.getElementById('blind-reveal-btn').addEventListener('click', async () => {
+        if (!currentTraining) return;
+        currentTraining.identityRevealed = !currentTraining.identityRevealed;
+        updateBlindControls();
+        await refreshTrainingView();
+        await updateTradeHistory();
+    });
+
+    document.getElementById('data-source').addEventListener('change', event => {
+        localStorage.setItem('trainingDataSource', event.target.value);
+        updateGalaxyPoolControl();
+    });
 
     // 设置按钮
     document.getElementById('training-practice')?.addEventListener('change', (event) => {
         if (event.target.value === 'ma55') {
-            document.getElementById('data-source').value = 'offline';
             document.getElementById('kline-period').value = '15m';
         }
     });
@@ -684,6 +696,12 @@ function setupEventListeners() {
     document.getElementById('confirm-sync-btn')?.addEventListener('click', syncOfflineData);
     document.getElementById('cancel-sync-btn')?.addEventListener('click', hideDataSyncModal);
     document.getElementById('sync-scope')?.addEventListener('change', updateSyncScopeUI);
+    document.getElementById('stop-sync-btn').addEventListener('click', stopSyncJob);
+    ['inventory-btn', 'sync-inventory-btn', 'setup-inventory-btn'].forEach(id => document.getElementById(id).addEventListener('click', showInventory));
+    document.getElementById('inventory-close-btn').addEventListener('click', () => document.getElementById('inventory-modal').classList.add('hidden'));
+    document.getElementById('inventory-refresh-btn').addEventListener('click', refreshInventory);
+    document.getElementById('inventory-search').addEventListener('input', renderInventoryRows);
+    document.getElementById('inventory-excluded').addEventListener('change', renderInventoryRows);
     document.querySelectorAll('.view-period-btn').forEach((button) => {
         button.addEventListener('click', () => {
             switchViewPeriod(button.dataset.period || 'daily');
@@ -1008,6 +1026,7 @@ function toggleToolbarForTraining(isTraining) {
         document.getElementById('switch-user-btn'),
         document.getElementById('theme-toggle-btn'),
         document.getElementById('data-sync-btn'),
+        document.getElementById('inventory-btn'),
         document.getElementById('settings-btn'),
         document.getElementById('new-training-btn'),
         document.getElementById('main-title') // 新增的标题元素
@@ -1155,6 +1174,14 @@ async function showTrainingSetup(returnScreen = null) {
         }
     }
     document.getElementById('training-setup').classList.remove('hidden');
+    const rangeStart = document.getElementById('random-start-date');
+    if (!rangeStart.dataset.initialized) {
+        const end = new Date(); end.setDate(end.getDate() - 30);
+        const start = new Date(end); start.setFullYear(start.getFullYear() - 1);
+        rangeStart.value = start.toISOString().slice(0, 10);
+        document.getElementById('random-end-date').value = end.toISOString().slice(0, 10);
+        rangeStart.dataset.initialized = 'true';
+    }
     // 设置默认日期为一年前
     const oneYearAgo = new Date();
     oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
@@ -1170,7 +1197,7 @@ function showDataSyncModal() {
     const modal = document.getElementById('data-sync-modal');
     if (!modal) return;
 
-    const currentStock = currentTraining?.stock_code || document.getElementById('stock-code')?.value || '';
+    const currentStock = (blindIdentityHidden() ? '' : currentTraining?.stock_code) || document.getElementById('stock-code')?.value || '';
     const stockInput = document.getElementById('sync-stock-code');
     const startInput = document.getElementById('sync-start-date');
     const endInput = document.getElementById('sync-end-date');
@@ -1192,7 +1219,7 @@ function showDataSyncModal() {
         endInput.value = new Date().toISOString().split('T')[0];
     }
     if (sourceSelect && !sourceSelect.value) {
-        sourceSelect.value = 'akshare';
+        sourceSelect.value = 'galaxy';
     }
     if (forceFull) forceFull.checked = false;
     if (scopeSelect && !scopeSelect.value) {
@@ -1214,6 +1241,7 @@ function showDataSyncModal() {
 
     updateSyncScopeUI();
     modal.classList.remove('hidden');
+    loadSyncHistory();
 }
 
 function hideDataSyncModal() {
@@ -1241,12 +1269,6 @@ function updateSyncProgress(completed, total, label = '') {
     progressText.textContent = label || `${completed}/${total}`;
 }
 
-function getSyncThrottleMs(source) {
-    if (source === 'xtdata') return 40;
-    if (source === 'mootdx') return 240;
-    return 260;
-}
-
 function getSyncScopeLabel(scope) {
     if (scope === 'sh') return '全沪市';
     if (scope === 'sz') return '全深市';
@@ -1265,135 +1287,6 @@ function describeSyncRange(startDate, endDate) {
         return `截至 ${endDate}`;
     }
     return '默认区间';
-}
-
-async function syncSingleStock(stockCode, source, startDate, endDate, forceFull) {
-    const response = await fetch(`${API_BASE}/data/sync`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            stock_code: stockCode,
-            source,
-            start_date: startDate || null,
-            end_date: endDate || null,
-            force_full: forceFull,
-            interval: document.getElementById('sync-interval').value,
-        }),
-    });
-    const result = await response.json();
-    if (!response.ok) {
-        throw new Error(result.error || '补数失败');
-    }
-    return result;
-}
-
-async function syncOfflineData() {
-    const scope = document.getElementById('sync-scope')?.value || 'single';
-    const stockCode = document.getElementById('sync-stock-code')?.value.trim();
-    const source = document.getElementById('sync-source')?.value || 'akshare';
-    const startDate = document.getElementById('sync-start-date')?.value || '';
-    const endDate = document.getElementById('sync-end-date')?.value || '';
-    const forceFull = !!document.getElementById('sync-force-full')?.checked;
-    const resultBox = document.getElementById('sync-result');
-    const btn = document.getElementById('confirm-sync-btn');
-
-    if (scope === 'single' && !stockCode) {
-        alert('请输入股票代码');
-        return;
-    }
-    if (startDate && endDate && startDate > endDate) {
-        alert('结束日期不能早于开始日期');
-        return;
-    }
-
-    if (btn) btn.disabled = true;
-    if (resultBox) {
-        resultBox.classList.remove('hidden');
-        resultBox.textContent = scope === 'single'
-            ? `正在按区间 ${describeSyncRange(startDate, endDate)} 同步离线数据，请稍候...`
-            : `正在准备批量补数列表（区间 ${describeSyncRange(startDate, endDate)}）...`;
-    }
-
-    try {
-        if (scope === 'single') {
-            updateSyncProgress(0, 1, '正在同步 1/1');
-            const result = await syncSingleStock(stockCode, source, startDate, endDate, forceFull);
-            updateSyncProgress(1, 1, '已完成 1/1');
-            if (resultBox) {
-                resultBox.classList.remove('hidden');
-                const beforeRange = result.range_before ? `${result.range_before.start} ~ ${result.range_before.end}` : '无本地数据';
-                const afterRange = result.range_after ? `${result.range_after.start} ~ ${result.range_after.end}` : '无数据';
-                const plannedRangeText = Array.isArray(result.planned_ranges) && result.planned_ranges.length > 0
-                    ? ` 计划补齐 ${result.planned_ranges.map(item => `${item.start} ~ ${item.end}`).join('；')}。`
-                    : '';
-                const fetchedRangeText = Array.isArray(result.fetched_ranges) && result.fetched_ranges.length > 0
-                    ? ` 实际抓取 ${result.fetched_ranges.map(item => `${item.start} ~ ${item.end}`).join('；')}。`
-                    : '';
-                const missingRangeText = Array.isArray(result.missing_ranges) && result.missing_ranges.length > 0
-                    ? ` 在线源未返回 ${result.missing_ranges.map(item => `${item.start} ~ ${item.end}`).join('；')}。`
-                    : '';
-                const fileStateText = result.local_file_changed === false ? ' 本地文件未改动。' : '';
-                resultBox.textContent = `完成: ${result.message} 请求区间 ${describeSyncRange(startDate, endDate)}，本地范围 ${beforeRange} -> ${afterRange}，新增 ${result.added_rows || 0} 条，抓取 ${result.fetched_rows || 0} 条。${plannedRangeText}${fetchedRangeText}${missingRangeText}${fileStateText}`;
-                if (result.periods) {
-                    resultBox.textContent = `${result.status} · ${result.message}\n` + result.periods.map(item =>
-                        `${item.period}: ${item.status} · 抓取 ${item.fetched_rows} / 预期 ${item.expected_bars ?? '?'} · 缺口 ${item.missing_bars?.length ?? '?'} · ${item.error || item.gap_reason || '已齐'}${item.missing_bars?.length ? ' · 示例 ' + item.missing_bars.slice(0, 5).join(', ') : ''}`
-                    ).join('\n');
-                }
-            }
-        } else {
-            const universeResponse = await fetch(`${API_BASE}/data/stock_universe?market=${scope}`);
-            const universePayload = await universeResponse.json();
-            if (!universeResponse.ok) {
-                throw new Error(universePayload.error || '获取股票列表失败');
-            }
-
-            const stockCodes = universePayload.stock_codes || [];
-            if (stockCodes.length === 0) {
-                throw new Error('当前市场没有可补数的股票列表');
-            }
-
-            let successCount = 0;
-            let failureCount = 0;
-            let addedRows = 0;
-            let latestSuccessCode = '';
-            const throttleMs = getSyncThrottleMs(source);
-
-            for (let index = 0; index < stockCodes.length; index += 1) {
-                const code = stockCodes[index];
-                updateSyncProgress(index, stockCodes.length, `正在补数 ${index + 1}/${stockCodes.length}：${code}`);
-                try {
-                    const result = await syncSingleStock(code, source, startDate, endDate, forceFull);
-                    if (result.success === false) failureCount += 1;
-                    else successCount += 1;
-                    addedRows += result.added_rows || 0;
-                    if (result.success !== false) latestSuccessCode = code;
-                } catch (error) {
-                    failureCount += 1;
-                    console.error(`批量补数失败 ${code}:`, error);
-                }
-
-                if (index < stockCodes.length - 1) {
-                    await sleep(throttleMs);
-                }
-            }
-
-            updateSyncProgress(stockCodes.length, stockCodes.length, `批量补数完成 ${stockCodes.length}/${stockCodes.length}`);
-            if (resultBox) {
-                resultBox.classList.remove('hidden');
-                resultBox.textContent = `完成: ${getSyncScopeLabel(scope)}区间 ${describeSyncRange(startDate, endDate)}，共 ${stockCodes.length} 只，成功 ${successCount}，失败 ${failureCount}，累计新增 ${addedRows} 条。${latestSuccessCode ? ` 最近成功股票 ${latestSuccessCode}。` : ''}`;
-            }
-        }
-    } catch (error) {
-        console.error('离线数据补充失败:', error);
-        if (resultBox) {
-            resultBox.classList.remove('hidden');
-            resultBox.textContent = `失败: ${error.message || '未知错误'}`;
-        }
-    } finally {
-        if (btn) btn.disabled = false;
-    }
 }
 
 function showSettings() {
@@ -1651,7 +1544,7 @@ function applyTrainingSnapshot(data, options = {}) {
     if (data.practice_context) {
         document.getElementById('ma55-coverage').textContent = Object.entries(data.practice_context).map(([period, info]) => {
             const label = {daily: '日线', '60m': '60分', '15m': '15分'}[period];
-            return `${label}：${info.error || `${info.bars}根 · ${info.as_of} · MA55${info.ma55_ready ? '可用' : '不足'} / MA233${info.ma233_ready ? '可用' : '不足'}`}`;
+            return `${label}：${info.error || `${info.bars}根 · ${blindIdentityHidden() ? '日期已隐藏' : info.as_of} · MA55${info.ma55_ready ? '可用' : '不足'} / MA233${info.ma233_ready ? '可用' : '不足'}`}`;
         }).join('；');
     }
     candlestickSeries.setData(data.kline_data);
@@ -1689,7 +1582,8 @@ async function refreshTrainingView(options = {}) {
 
     const data = await response.json();
     if (data.stock_name) {
-        document.getElementById('stock-name').textContent = data.stock_name;
+        currentTraining.stockName = data.stock_name;
+        updateBlindControls();
     }
     applyTrainingSnapshot(data, { fitContent });
     await loadTechnicalIndicator(currentIndicatorType);
@@ -1724,12 +1618,54 @@ async function switchViewPeriod(period) {
     }
 }
 
+
+function blindIdentityHidden() {
+    return currentTraining?.mode === 'random' && !currentTraining.identityRevealed;
+}
+
+function updateGalaxyPoolControl() {
+    document.getElementById('galaxy-pool-group').classList.toggle('hidden',
+        document.getElementById('data-source').value !== 'galaxy');
+}
+
+function formatChartTime(time) {
+    if (blindIdentityHidden()) return '日期已隐藏';
+    const date = typeof time === 'object'
+        ? new Date(Date.UTC(time.year, time.month - 1, time.day)) : new Date(time * 1000);
+    const day = `${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
+    return day + (['15m', '60m'].includes(currentPeriod)
+        ? ` ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}` : '');
+}
+
+function updateBlindControls() {
+    const button = document.getElementById('blind-reveal-btn');
+    const hidden = blindIdentityHidden();
+    button.classList.toggle('hidden', currentTraining?.mode !== 'random');
+    button.textContent = hidden ? '揭晓股票与日期' : '隐藏股票与日期';
+    button.setAttribute('aria-pressed', String(!hidden));
+    document.getElementById('stock-name').textContent = hidden ? '盲盒股票'
+        : currentTraining?.stockName || currentTraining?.stock_code || '股票名称';
+    const notices = [];
+    if (currentTraining?.galaxy_pool_size != null) notices.push(`当前日期/板块及 MA233 条件筛出 ${currentTraining.galaxy_pool_size} 只银河样本（不代表总下载量），本局读取本地。`);
+    if (currentTraining?.galaxy_pool_size === 1) notices.push('当前条件下仅 1 只，只能随机日期；可提前补充更多股票。');
+    if (currentTraining?.offline_pool_size === 1) notices.push('离线股票池仅 1 只，只能随机日期；选择银河可抽取更多股票。');
+    const gaps = (currentTraining?.coverage || []).filter(item => item.status !== 'COMPLETE');
+    if (gaps.length) notices.push('银河数据：' + gaps.map(item => item.status === 'PARTIAL'
+        ? `${item.period} PARTIAL，缺 ${item.missing_count} 根`
+        : `${item.period} 最近补数${item.status === 'FAILED' ? '失败' : '无覆盖回执'}，已有数据完整性未确认`).join('；'));
+    document.getElementById('training-data-notice').textContent = notices.join(' ');
+    for (const view of [chart, volumeChart, indicatorChart]) {
+        if (view) view.applyOptions({ localization: { timeFormatter: formatChartTime },
+            timeScale: { tickMarkFormatter: formatChartTime } });
+    }
+}
+
 // 训练管理
 async function startTraining() {
-    const isRandomMode = document.querySelector('.tab-btn.active').dataset.tab === 'random';
+    const isRandomMode = document.querySelector('#training-setup .tab-btn.active').dataset.tab === 'random';
     const initialCapital = parseFloat(document.getElementById('initial-capital').value);
     const practice = document.getElementById('training-practice').value;
-    const dataSource = practice === 'ma55' ? 'offline' : document.getElementById('data-source').value || 'akshare';
+    const dataSource = document.getElementById('data-source').value || 'galaxy';
     const period = practice === 'ma55' ? '15m' : document.getElementById('kline-period').value;
     await loadUserSettings();
     if (practice === 'ma55') maPeriods = [5, 10, 20, 55, 233];
@@ -1744,6 +1680,7 @@ async function startTraining() {
     };
 
     if (isRandomMode) {
+        trainingConfig.allow_download = dataSource === 'galaxy' && document.getElementById('galaxy-random-pool').value === 'market';
         trainingConfig.sector = document.getElementById('sector-filter').value;
         trainingConfig.date_start = document.getElementById('random-start-date').value.trim();
         trainingConfig.date_end = document.getElementById('random-end-date').value.trim();
@@ -1761,11 +1698,15 @@ async function startTraining() {
     }
 
     try {
+        document.getElementById('start-training-btn').disabled = true;
         updatePeriodBadge(period);
+        const cachedGalaxy = dataSource === 'galaxy' && isRandomMode && !trainingConfig.allow_download;
         showLoading(
-            dataSource === 'offline' ? '正在筛选本地离线数据' : '正在创建训练',
-            dataSource === 'offline' ? '首次校验离线股票可用范围时会稍慢一些。' : '正在准备图表和训练数据...'
+            cachedGalaxy ? '正在读取已下载数据' : dataSource === 'galaxy' ? '正在检查银河数据' : dataSource === 'offline' ? '正在筛选本地离线数据' : '正在创建训练',
+            cachedGalaxy ? '本次不联网：筛选本地股票和日期，计算 MA 并绘制图表。'
+                : dataSource === 'galaxy' ? '已有可用数据直接读取；缺失时下载三周期行情，可能需要数分钟。' : '正在准备图表和训练数据...'
         );
+        trainingConfig.background = dataSource === 'galaxy' && !cachedGalaxy;
         const response = await fetch(`${API_BASE}/training/start`, {
             method: 'POST',
             headers: {
@@ -1775,7 +1716,10 @@ async function startTraining() {
         });
 
         if (response.ok) {
-            currentTraining = await response.json();
+            const reply = await response.json();
+            currentTraining = response.status === 202 ? await waitForTrainingJob(reply.job_id) : reply;
+            currentTraining.identityRevealed = currentTraining.mode !== 'random';
+            updateBlindControls();
             document.getElementById('ma55-practice-panel').classList.toggle('hidden', practice !== 'ma55');
             document.querySelectorAll('#ma55-practice-panel input').forEach(input => { input.checked = false; });
             const adjustment = currentTraining.adjustment_mode || 'forward';
@@ -1796,8 +1740,9 @@ async function startTraining() {
         }
     } catch (error) {
         console.error('开始训练失败:', error);
-        alert('开始训练失败');
+        alert(error.message || '开始训练失败');
     } finally {
+        document.getElementById('start-training-btn').disabled = false;
         hideLoading();
     }
 }
@@ -1853,27 +1798,14 @@ function initializeChart() {
         // 使用 localization 选项来格式化十字标线的时间
         localization: {
             // timeFormatter 用于格式化十字标线悬浮窗中的时间
-            timeFormatter: (businessDay) => {
-                // businessDay 是一个 Date 对象，包含了年、月、日
-                // 注意：这里的 businessDay 是一个 UTC 日期对象，所以使用 getUTCFullYear 等方法可以避免时区问题
-                const date = new Date(businessDay * 1000);
-
-                const year = date.getUTCFullYear();
-                const month = ('0' + (date.getUTCMonth() + 1)).slice(-2); // 月份从0开始
-                const day = ('0' + date.getUTCDate()).slice(-2);
-
-                return `${year}年${month}月${day}日` + (['15m', '60m'].includes(currentPeriod) ? ` ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}` : '');
-            },
+            timeFormatter: formatChartTime,
             locale: 'zh-CN',
         },
         timeScale: {
             borderColor: palette.border,
             timeVisible: true,
             secondsVisible: false,
-            tickMarkFormatter: (time) => {
-                const date = new Date(time * 1000);
-                return ['15m', '60m'].includes(currentPeriod) ? `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}` : `${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
-            }
+            tickMarkFormatter: formatChartTime
         },
     });
 
@@ -1918,6 +1850,7 @@ function initializeChart() {
     volumeContainer.innerHTML = '';
 
     volumeChart = LightweightCharts.createChart(volumeContainer, {
+        localization: { timeFormatter: formatChartTime },
         width: volumeContainer.clientWidth,
         height: volumeContainer.clientHeight,
         layout: {
@@ -1939,10 +1872,7 @@ function initializeChart() {
         timeScale: {
             borderColor: palette.border,
             visible: false,
-            tickMarkFormatter: (time) => {
-                const date = new Date(time * 1000);
-                return ['15m', '60m'].includes(currentPeriod) ? `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}` : `${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
-            }
+            tickMarkFormatter: formatChartTime
         },
     });
 
@@ -1972,6 +1902,7 @@ function initializeChart() {
     indicatorContainer.appendChild(indicatorLegend);
 
     indicatorChart = LightweightCharts.createChart(indicatorContainer, {
+        localization: { timeFormatter: formatChartTime },
         width: indicatorContainer.clientWidth,
         height: indicatorContainer.clientHeight,
         layout: {
@@ -1993,10 +1924,7 @@ function initializeChart() {
         timeScale: {
             borderColor: palette.border,
             visible: false,
-            tickMarkFormatter: (time) => {
-                const date = new Date(time * 1000);
-                return ['15m', '60m'].includes(currentPeriod) ? `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}` : `${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
-            }
+            tickMarkFormatter: formatChartTime
         },
     });
 
@@ -2265,7 +2193,8 @@ async function loadInitialData() {
         const data = await response.json();
 
         // 更新股票信息
-        document.getElementById('stock-name').textContent = data.stock_name || '未知股票';
+        currentTraining.stockName = data.stock_name || '未知股票';
+        updateBlindControls();
         applyTrainingSnapshot(data, { fitContent: true });
 
         // 加载技术指标
@@ -2319,7 +2248,7 @@ function updateCurrentInfo(barData, progress) {
 
     const date = new Date(barData.time * 1000);
     const formattedDate = `${date.getFullYear()}/${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}`;
-    document.getElementById('current-date').textContent = progress?.current_time || formattedDate;
+    document.getElementById('current-date').textContent = blindIdentityHidden() ? '日期已隐藏' : progress?.current_time || formattedDate;
     document.getElementById('current-price').textContent = `¥${barData.close.toFixed(2)}`;
 
     // 显示当前bar ID
@@ -2942,7 +2871,7 @@ async function updateTradeHistory() {
             tradeItem.innerHTML = `
                 <div class="trade-header">
                     <span class="trade-action">${trade.action === 'buy' ? '买入' : '卖出'}</span>
-                    <span class="trade-time">${trade.trade_date}</span>
+                    <span class="trade-time">${blindIdentityHidden() ? '日期已隐藏' : trade.trade_date}</span>
                 </div>
                 <div class="trade-details">
                     <div>Bar ID: ${trade.bar_id}</div>
@@ -3405,6 +3334,8 @@ async function requestAIAnalysis() {
  * @param {object} report - 包含所有报告数据的对象
  */
 function showReport(report) {
+    if (currentTraining) currentTraining.identityRevealed = true;
+    updateBlindControls();
     // 保存当前报告数据供 AI 分析使用
     currentReportData = report;
     setTrainingViewOnlyMode(false, { showBackToReport: false });

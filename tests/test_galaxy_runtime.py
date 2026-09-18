@@ -206,3 +206,24 @@ def test_real_windows_cleanup_reaps_venv_interpreter(local_runtime):
             galaxy_runtime.stop_windows_process(run)
         if handle:
             kernel.CloseHandle(handle)
+
+
+def test_only_full_fresh_calendar_is_reused(local_runtime):
+    scripts = local_runtime / 'scripts'
+    scripts.mkdir()
+    calendar_path = local_runtime / 'data' / 'galaxy_calendar.json'
+    calendar_path.parent.mkdir()
+    calendar_path.write_text(json.dumps({'start': '20250101', 'end': '20260918',
+                                        'dates': ['20260917', '20260918'], 'source': 'galaxy'}))
+    (scripts / 'galaxy_worker.py').write_text(
+        "import json,sys\nfrom pathlib import Path\n"
+        "request=json.loads(Path(sys.argv[1]).read_text())\n"
+        "full=['20130104','20260917','20260918']\n"
+        "result={'calendar':['20260917'], 'sdk_calendar':full, 'periods':{}, 'input_calendar':request.get('calendar')}\n"
+        "Path(sys.argv[2]).write_text(json.dumps(result))\n", encoding='utf-8')
+    args = ('000001.SZ', pd.Timestamp('2026-09-17'), pd.Timestamp('2026-09-17'), [])
+    result = galaxy_data.query_galaxy(*args)
+    assert result['input_calendar'] is None  # Old clipped cache cannot change the factor basis.
+    saved = json.loads(calendar_path.read_text())
+    assert saved['full'] and saved['start'] == '20130104'
+    assert galaxy_data.query_galaxy(*args)['input_calendar'] == [20130104, 20260917, 20260918]

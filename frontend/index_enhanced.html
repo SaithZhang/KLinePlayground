@@ -73,7 +73,8 @@
             </div>
             <div class="toolbar-right">
                 <button id="theme-toggle-btn" class="btn btn-secondary">深色主题</button>
-                <button id="data-sync-btn" class="btn btn-secondary">数据更新器</button>
+                <button id="data-sync-btn" class="btn btn-secondary">下载 / 补数</button>
+                <button id="inventory-btn" class="btn btn-secondary">本地数据</button>
                 <button id="settings-btn" class="btn btn-secondary">设置</button>
                 <button id="new-training-btn" class="btn btn-primary">新建训练</button>
             </div>
@@ -195,6 +196,13 @@
                 </div>
 
                 <div id="random-tab" class="tab-content">
+                    <div id="galaxy-pool-group" class="form-group">
+                        <label for="galaxy-random-pool">银河抽取范围</label>
+                        <select id="galaxy-random-pool">
+                            <option value="cached" selected>已下载数据（快速开局，不联网）</option>
+                            <option value="market">全市场（缺失时下载，需要等待）</option>
+                        </select>
+                    </div>
                     <div class="form-group">
                         <label>板块筛选</label>
                         <select id="sector-filter">
@@ -218,7 +226,8 @@
                     <div class="form-group">
                         <label>数据源</label>
                         <select id="data-source">
-                            <option value="akshare" selected>AKShare（免费公网）</option>
+                            <option value="galaxy" selected>银河 AmazingData（推荐）</option>
+                            <option value="akshare">AKShare（免费公网）</option>
                             <option value="xtdata">xtdata / XTQuant（本地）</option>
                             <option value="mootdx">mootdx（通达信协议）</option>
                             <option value="offline">本地离线数据</option>
@@ -228,7 +237,7 @@
                         <label for="training-practice">训练预设</label>
                         <select id="training-practice">
                             <option value="free">自由训练</option>
-                            <option value="ma55">55 战法（离线 · 15分推进）</option>
+                            <option value="ma55">55 战法（银河三周期 · 15分推进）</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -245,8 +254,10 @@
                     </div>
                 </div>
 
+                <p class="helper-text">银河盲盒默认从已下载数据中随机抽取，只读取本地和计算指标。需要新股票时可选择全市场抽取下载。盲盒默认隐藏股票和日期。</p>
                 <div class="modal-actions">
                     <button id="start-training-btn" class="btn btn-primary">开始训练</button>
+                    <button id="setup-inventory-btn" class="btn btn-secondary" type="button">查看本地覆盖与筛选原因</button>
                     <button id="cancel-setup-btn" class="btn btn-secondary">取消</button>
                 </div>
             </div>
@@ -254,7 +265,9 @@
 
         <div id="data-sync-modal" class="modal hidden">
             <div class="modal-content">
-                <h2>增量补充离线数据</h2>
+                <h2>下载 / 补数</h2>
+                <button id="sync-inventory-btn" class="btn btn-secondary" type="button">查看已下载数据</button>
+                <p class="helper-text">批次进度与结果自动保存，刷新页面后可继续查看；退出应用会中断任务。完整、有缺口、失败和未处理会分别计数。</p>
                 <p class="helper-text">公开源补日线；银河支持日线、15分、60分。银河会重查所选区间以修复内部缺口，同源合并，保留区间外历史；缺失时段会明确列出。</p>
                 <div class="form-grid">
                     <div class="form-group">
@@ -266,14 +279,15 @@
                             <option value="all">全市场</option>
                         </select>
                     </div>
-                    <div class="form-group">
+                    <div class="form-group" id="sync-stock-code-group">
                         <label>股票代码</label>
                         <input type="text" id="sync-stock-code" placeholder="例如: 000001">
                     </div>
                     <div class="form-group">
                         <label>在线数据源</label>
                         <select id="sync-source">
-                            <option value="akshare" selected>AKShare</option>
+                            <option value="galaxy" selected>银河 AmazingData</option>
+                            <option value="akshare">AKShare</option>
                             <option value="xtdata" hidden>xtdata / XTQuant</option>
                             <option value="mootdx" hidden>mootdx</option>
                         </select>
@@ -284,7 +298,7 @@
                             <option value="daily">日线</option>
                             <option value="15m">15 分钟（银河）</option>
                             <option value="60m">60 分钟（银河）</option>
-                            <option value="all">55 战法三周期（日/15分/60分）</option>
+                            <option value="all" selected>55 战法三周期（日/15分/60分）</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -306,11 +320,34 @@
                     </div>
                     <div id="sync-progress-text" class="sync-progress-text">准备中...</div>
                 </div>
-                <div id="sync-result" class="sync-result hidden"></div>
+                <progress id="sync-stage-progress" class="hidden" aria-label="当前股票处理阶段"></progress>
+                <div id="sync-result" class="sync-result hidden" role="status" aria-live="polite"></div>
+                <a id="sync-report-link" class="hidden" href="#">下载完整批次记录（含失败原因）</a>
+                <details><summary>最近补数记录</summary><div id="sync-history"></div></details>
                 <div class="modal-actions">
                     <button id="confirm-sync-btn" class="btn btn-primary">开始补数</button>
-                    <button id="cancel-sync-btn" class="btn btn-secondary">取消</button>
+                    <button id="stop-sync-btn" class="btn btn-secondary hidden">停止本批（当前股票结束后）</button>
+                    <button id="cancel-sync-btn" class="btn btn-secondary">关闭面板</button>
                 </div>
+            </div>
+        </div>
+
+        <div id="inventory-modal" class="modal hidden">
+            <div class="modal-content inventory-content">
+                <h2>本地数据与盲盒覆盖</h2>
+                <p id="inventory-environment" class="helper-text"></p>
+                <div class="form-grid">
+                    <label>盲盒开始范围<input id="inventory-start" type="date"></label>
+                    <label>盲盒结束范围<input id="inventory-end" type="date"></label>
+                    <label>搜索股票<input id="inventory-search" placeholder="名称或代码"></label>
+                </div>
+                <label><input id="inventory-excluded" type="checkbox">只看当前不可训练的股票</label>
+                <button id="inventory-refresh-btn" class="btn btn-secondary">按所选范围检查</button>
+                <p id="inventory-summary" role="status"></p>
+                <p class="helper-text">可训练需日线、15分、60分各有233根历史，并留有后续行情。下载数量、完整性、可训练数量是三件不同的事。表中覆盖来自实际文件；缺口来自最近补数回执，不表示全历史已完整核验。</p>
+                <p id="inventory-row-count" class="helper-text"></p>
+                <div class="inventory-table-wrap"><table class="inventory-table"><thead><tr><th>股票</th><th>日线</th><th>15分钟</th><th>60分钟</th><th>当前范围能否训练</th></tr></thead><tbody id="inventory-rows"></tbody></table></div>
+                <div class="modal-actions"><button id="inventory-close-btn" class="btn btn-secondary">关闭</button></div>
             </div>
         </div>
 
@@ -381,6 +418,7 @@
                         <span id="stock-name">股票名称</span>
                         <span id="current-period" class="period-badge">日K</span>
                         <span id="current-date">当前日期</span>
+                        <button id="blind-reveal-btn" class="btn btn-secondary hidden" type="button" aria-pressed="false">揭晓股票与日期</button>
                         <span id="current-price">当前价格</span>
                     </div>
                     <div class="chart-actions">
@@ -392,6 +430,7 @@
                         </div>
                     </div>
                 </div>
+                <p id="training-data-notice" class="helper-text" role="status"></p>
                 <div id="chart" class="chart"></div>
                 <div id="volume-chart" class="volume-chart"></div>
                 <div id="indicator-chart" class="indicator-chart">
@@ -509,11 +548,13 @@
                 <div class="loading-spinner"></div>
                 <div id="loading-title" class="loading-title">正在加载</div>
                 <div id="loading-detail" class="loading-detail">请稍候...</div>
+                <progress id="loading-progress" class="hidden" max="1" aria-label="训练数据准备进度"></progress>
             </div>
         </div>
     </div>
 
     <script src="js/marked.min.js"></script>
     <script src="js/main_enhanced.js"></script>
+    <script src="js/data_status.js"></script>
 </body>
 </html>
