@@ -6,7 +6,7 @@ const PERIOD_LABELS = {daily: '日线', '15m': '15分钟', '60m': '60分钟', al
 const JOB_LABELS = {RUNNING: '处理中', COMPLETE: '全部完整', PARTIAL: '存在缺口或未处理项', FAILED: '失败', STOPPED: '已停止', INTERRUPTED: '已中断'};
 const STAGE_LABELS = {PREPARE: '准备请求', UNIVERSE: '获取所选数据源的全市场股票名录', FETCH: '请求行情',
     WAITING: '等待银河数据通道', RUNTIME: '启动银河运行环境', IMPORT: '加载银河 SDK', LOGIN: '连接银河',
-    CALENDAR: '读取交易日历', FACTORS: '读取复权因子', CACHE_CHECK: '检查本地三周期覆盖',
+    CALENDAR: '读取交易日历', FACTORS: '读取复权因子', FACTORS_DOWNLOAD: '下载当前股票复权因子', FACTORS_CACHE: '读取已验证复权因子缓存', CACHE_CHECK: '检查本地三周期覆盖',
     CACHE_MISS: '本地历史不足，开始下载', CACHE_HIT: '本地数据已满足，直接读取',
     CALCULATE: '计算指标并创建训练', SAVE: '接收查询结果', SOURCE_ERROR: '数据源返回错误'};
 

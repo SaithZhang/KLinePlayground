@@ -940,7 +940,7 @@ def sync_jobs():
     config.setdefault('interval', 'daily')
     if config.get('scope', 'single') not in {'single', 'all', 'sh', 'sz'}:
         return jsonify({'error': '未知补数范围'}), 400
-    if config.get('source') not in {'galaxy', 'akshare', 'xtdata', 'mootdx'}:
+    if config.get('source') not in {'galaxy', 'akshare', 'a_stock_data', 'xtdata', 'mootdx'}:
         return jsonify({'error': '请选择有效数据源'}), 400
     if config.get('interval', 'daily') not in {'daily', '15m', '60m', 'all'}:
         return jsonify({'error': '未知补数周期'}), 400

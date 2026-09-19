@@ -1,13 +1,15 @@
-"""One-shot SDK worker, shared by native Python and the macOS ad-api container."""
+"""SDK worker for one request or one bounded download batch; no resident service."""
 import json
 import math
 import os
 from pathlib import Path
 import sys
 import traceback
+import time
 
 
-def main(request_path, output_path):
+def main(request_path, output_path, sdk=None):
+    sdk = {} if sdk is None else sdk
     request = json.loads(Path(request_path).read_text(encoding="utf-8"))
     result = {"periods": {}}
     def progress(stage):
@@ -23,11 +25,13 @@ def main(request_path, output_path):
         import pandas as pd
 
         Path(os.environ["AD_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-        stage = "LOGIN"
-        progress(stage)
-        ad.login(username=os.environ["AD_USERNAME"], password=os.environ["AD_PASSWORD"],
-                 host=os.environ["AD_HOST"], port=int(os.environ["AD_PORT"]))
-        base = ad.BaseData()
+        if "base" not in sdk:
+            stage = "LOGIN"
+            progress(stage)
+            ad.login(username=os.environ["AD_USERNAME"], password=os.environ["AD_PASSWORD"],
+                     host=os.environ["AD_HOST"], port=int(os.environ["AD_PORT"]))
+            sdk["base"] = ad.BaseData()
+        base = sdk["base"]
         if request.get("code") is None:
             stage = "UNIVERSE"
             progress(stage)
@@ -47,18 +51,42 @@ def main(request_path, output_path):
         # needs the original full calendar to keep its price basis unchanged.
         base.get_calendar = lambda *args, **kwargs: calendar
         result["sdk_calendar"] = [str(d)[:10].replace("-", "") for d in calendar]
-        market = ad.MarketData(calendar)
+        if "market" not in sdk:
+            sdk["market"] = ad.MarketData(calendar)
+        market = sdk["market"]
         code = request["code"]
         start, end = request["start"], request["end"]
         result["calendar"] = [str(d)[:10].replace("-", "") for d in calendar
                               if start <= str(d)[:10].replace("-", "") <= end]
         stage = "FACTORS"
         progress(stage)
-        factors = base.get_backward_factor([code], local_path=os.environ["AD_CACHE_DIR"], is_local=False)
-        if code not in factors.columns:
-            raise ValueError("missing factors")
-        result["factors"] = [[str(d)[:10], float(v)] for d, v in factors[code].items()
-                             if start <= str(d)[:10].replace("-", "") <= end and pd.notna(v)]
+        # SDK refresh unions requested symbols with every symbol in its HDF5 cache.
+        # Isolate each symbol so a one-stock episode never refreshes a global universe.
+        cache = Path(os.environ["AD_CACHE_DIR"]) / "kline_playground" / code
+        cache.mkdir(parents=True, exist_ok=True)
+        cache_file = cache / "verified_factors.json"
+        cached = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.is_file() else {}
+        required = set(result["calendar"])
+        cached_rows = cached.get("rows", [])
+        covered = {day.replace("-", "") for day, value in cached_rows if math.isfinite(value) and value > 0}
+        if required and required <= covered and cached.get("as_of") == pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d"):
+            progress("FACTORS_CACHE")
+            factor_rows = cached_rows
+        else:
+            progress("FACTORS_DOWNLOAD")
+            factors = base.get_backward_factor([code], local_path=str(cache) + os.sep, is_local=False)
+            if code not in factors.columns:
+                raise ValueError("missing factors")
+            factor_rows = [[str(d)[:10], float(v)] for d, v in factors[code].items() if pd.notna(v)]
+            covered = {day.replace("-", "") for day, value in factor_rows if math.isfinite(value) and value > 0}
+            if not required <= covered:
+                raise ValueError("incomplete factors")
+            temporary = cache_file.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"as_of": pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d"),
+                                             "rows": factor_rows}, allow_nan=False), encoding="utf-8")
+            temporary.replace(cache_file)
+        result["factors"] = [[day, value] for day, value in factor_rows
+                             if start <= day.replace("-", "") <= end]
         for period in request["periods"]:
             progress("KLINE_" + period)
             try:
@@ -91,6 +119,27 @@ def main(request_path, output_path):
     checkpoint()
 
 
+def serve(directory):
+    """Consume sequential, atomically published requests until this batch ends."""
+    root = Path(directory)
+    sdk = {}
+    idle_since = time.monotonic()
+    while root.is_dir() and not (root / "STOP").exists():
+        requests = sorted(root.glob("*/request.json"))
+        if not requests:
+            # An abandoned launcher must not leave a permanent SDK/container behind.
+            if time.monotonic() - idle_since > 120:
+                return
+            time.sleep(0.1)
+            continue
+        request = requests[0]
+        output = request.parent / "output.json"
+        main(str(request), str(output), sdk)
+        request.unlink()
+        output.with_suffix(".done").touch()
+        idle_since = time.monotonic()
+
+
 def check_runtime(output_path):
     """Import native dependencies without logging in or contacting the provider."""
     try:
@@ -112,5 +161,7 @@ if __name__ == "__main__":
         os.dup2(sink.fileno(), 2)
         if sys.argv[1] == "--check":
             check_runtime(sys.argv[2])
+        elif sys.argv[1] == "--serve":
+            serve(sys.argv[2])
         else:
             main(sys.argv[1], sys.argv[2])

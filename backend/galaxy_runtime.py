@@ -116,6 +116,9 @@ def launch_spec():
             raise ValueError("未找到银河 ad-api skill 入口，请设置 KLINE_GALAXY_RUNNER")
         executable, env = str(runner), os.environ.copy()
         env.setdefault("AD_DOCKER_IMAGE", "kline-galaxy:1.1.9-tables")
+        # GUI launches often resolve python3 to Apple's Xcode stub (exit 69).
+        # Keep the skill entrypoint, but use this application's working interpreter.
+        env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     return mode, executable, env
 
 

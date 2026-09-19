@@ -50,7 +50,8 @@ class DataManager:
     def download_stock_list(self) -> bool:
         """下载 A 股股票列表。"""
         try:
-            stock_list = ak.stock_info_a_code_name()
+            from backend.public_data import fetch
+            stock_list = fetch('universe', None, '2010-01-01')
             stock_list["code"] = stock_list["code"].astype(str).str.zfill(6)
 
             stock_list_path = os.path.join(self.data_dir, "stock_list.csv")
@@ -96,13 +97,18 @@ class DataManager:
                 **runtime_status(),
             },
             {
+                "value": "a_stock_data", "label": "a-stock-data（腾讯 + 新浪复权）",
+                "available": True, "kind": "online", "supports_incremental_sync": True,
+                "supports_factor": True, "description": "公开日线源，按 a-stock-data skill 接入；支持日线/周线。",
+            },
+            {
                 "value": "akshare",
                 "label": "AKShare",
                 "available": True,
                 "kind": "online",
                 "supports_incremental_sync": True,
                 "supports_factor": True,
-                "description": "免费公网日线源。",
+                "description": "AKShare 东财日线；不可用时整组切换腾讯行情 + 新浪复权，缓存保留实际来源。",
             },
             {
                 "value": "xtdata",
@@ -164,6 +170,12 @@ class DataManager:
         period = "daily" if interval == "weekly" else interval
         return os.path.join(self.offline_dir, "galaxy", period, self._format_xt_code(code) + ".csv")
 
+    def _get_public_archive(self, stock_code, source):
+        if source not in {"akshare", "a_stock_data", "xtdata", "mootdx"}:
+            raise ValueError("未知公开数据源")
+        code = self._normalize_stock_code(stock_code)
+        return os.path.join(self.offline_dir, source, "daily", self._format_xt_code(code) + ".csv")
+
     def _get_offline_file(self, stock_code: str, interval: str = "daily") -> Optional[str]:
         stock_code = self._normalize_stock_code(stock_code)
         if not stock_code:
@@ -180,6 +192,10 @@ class DataManager:
         for suffix in (".SZ", ".SH", ".BJ"):
             candidate = os.path.join(self.offline_dir, f"{stock_code}{suffix}.csv")
             if os.path.exists(candidate):
+                return candidate
+        for source in ("a_stock_data", "akshare", "xtdata", "mootdx"):
+            candidate = self._get_public_archive(stock_code, source)
+            if os.path.isfile(candidate):
                 return candidate
         return None
 
@@ -276,6 +292,8 @@ class DataManager:
         paths = list((Path(self.offline_dir) / "galaxy" / storage_period).glob("*.csv"))
         if storage_period == "daily":
             paths.extend(Path(self.offline_dir).glob("*.csv"))
+            for source in ("a_stock_data", "akshare", "xtdata", "mootdx"):
+                paths.extend((Path(self.offline_dir) / source / "daily").glob("*.csv"))
         return sorted({self._normalize_stock_code(path.stem) for path in paths})
 
     def _filter_stock_codes_by_sector(self, stock_codes: List[str], sector: str) -> List[str]:
@@ -626,7 +644,7 @@ class DataManager:
         return range_start, range_end
 
     def _supports_factor_refresh(self, source: str) -> bool:
-        return source in {"akshare", "xtdata"}
+        return source in {"akshare", "xtdata", "a_stock_data"}
 
     def _fetch_stock_bundle(
         self,
@@ -639,7 +657,10 @@ class DataManager:
             return self._fetch_stock_bundle_xt(stock_code, start_date, end_date=end_date)
         if source == "mootdx":
             return self._fetch_stock_bundle_mootdx(stock_code, start_date, end_date=end_date)
-        return self._fetch_stock_bundle_ak(stock_code, start_date, end_date=end_date)
+        if source in {"akshare", "a_stock_data"}:
+            from backend.public_data import fetch
+            return fetch(source, stock_code, start_date, end_date)
+        raise ValueError("未知数据源")
 
     def _fetch_stock_bundle_ak(
         self,
@@ -861,14 +882,8 @@ class DataManager:
             factor_df = self._normalize_factor_data(factor_raw, base_frame)
             return self._slice_date_range(factor_df, start_dt, end_dt)
 
-        raw_qfq = ak.stock_zh_a_hist(
-            symbol=stock_code,
-            period="daily",
-            start_date=start_dt.strftime("%Y%m%d"),
-            end_date=end_dt.strftime("%Y%m%d"),
-            adjust="qfq",
-        )
-        factor_df = self._normalize_factor_data(raw_qfq, base_frame)
+        bundle = self._fetch_stock_bundle(stock_code, start_date, source, end_date)
+        factor_df = bundle.get("factor")
         return self._slice_date_range(factor_df, start_dt, end_dt)
 
     def _attach_factor_column(
@@ -895,17 +910,18 @@ class DataManager:
         stock_code: str,
         kline_df: Optional[pd.DataFrame],
         factor_df: Optional[pd.DataFrame],
+        source: str = "akshare",
     ) -> bool:
         if kline_df is None or kline_df.empty:
             return False
 
-        kline_path = os.path.join(self.kline_dir, f"{stock_code}.csv")
+        kline_path = self._public_cache_path(self.kline_dir, stock_code, source)
         save_kline = kline_df.copy()
         save_kline["date"] = save_kline["date"].dt.strftime("%Y-%m-%d")
         save_kline.to_csv(kline_path, index=False, encoding="utf-8")
 
         if factor_df is not None and not factor_df.empty:
-            factor_path = os.path.join(self.factor_dir, f"{stock_code}.csv")
+            factor_path = self._public_cache_path(self.factor_dir, stock_code, source)
             save_factor = factor_df.copy()
             save_factor["date"] = save_factor["date"].dt.strftime("%Y-%m-%d")
             save_factor.to_csv(factor_path, index=False, encoding="utf-8")
@@ -917,20 +933,26 @@ class DataManager:
         stock_code = self._normalize_stock_code(stock_code)
         try:
             bundle = self._fetch_stock_bundle(stock_code, start_date, source)
-            return self._save_bundle_to_cache(stock_code, bundle.get("kline"), bundle.get("factor"))
+            return self._save_bundle_to_cache(stock_code, bundle.get("kline"), bundle.get("factor"), source=source)
         except Exception as e:
             print(f"下载股票 {stock_code} 数据失败: {e}")
             return False
 
-    def _load_cached_kline(self, stock_code: str) -> Optional[pd.DataFrame]:
-        kline_path = os.path.join(self.kline_dir, f"{stock_code}.csv")
+    def _public_cache_path(self, directory, code, source):
+        if source == "a_stock_data":
+            directory = os.path.join(directory, source)
+        os.makedirs(directory, exist_ok=True)
+        return os.path.join(directory, f"{code}.csv")
+
+    def _load_cached_kline(self, stock_code: str, source: str = "akshare") -> Optional[pd.DataFrame]:
+        kline_path = self._public_cache_path(self.kline_dir, stock_code, source)
         if not os.path.exists(kline_path):
             return None
         data = pd.read_csv(kline_path)
         return self._normalize_daily_kline(data)
 
-    def _load_cached_factor(self, stock_code: str) -> Optional[pd.DataFrame]:
-        factor_path = os.path.join(self.factor_dir, f"{stock_code}.csv")
+    def _load_cached_factor(self, stock_code: str, source: str = "akshare") -> Optional[pd.DataFrame]:
+        factor_path = self._public_cache_path(self.factor_dir, stock_code, source)
         if not os.path.exists(factor_path):
             return None
         data = pd.read_csv(factor_path)
@@ -956,11 +978,13 @@ class DataManager:
                 data = self._read_csv_with_fallback(offline_path)
                 normalized = self._normalize_offline_data(data)
             else:
-                normalized = self._load_cached_kline(stock_code)
+                archive = self._get_public_archive(stock_code, source)
+                normalized = (self._normalize_offline_data(self._read_csv_with_fallback(archive))
+                              if os.path.isfile(archive) else self._load_cached_kline(stock_code, source))
                 if normalized is None:
                     if not self.download_stock_data(stock_code, start_date="2010-01-01", source=source):
                         return None
-                    normalized = self._load_cached_kline(stock_code)
+                    normalized = self._load_cached_kline(stock_code, source)
 
             if normalized is None:
                 return None
@@ -997,7 +1021,12 @@ class DataManager:
                     return None
                 factor_df = normalized[["date", "factor"]].copy()
             else:
-                factor_df = self._load_cached_factor(stock_code)
+                archive = self._get_public_archive(stock_code, source)
+                if os.path.isfile(archive):
+                    frame = self._normalize_offline_data(self._read_csv_with_fallback(archive))
+                    factor_df = frame[["date", "factor"]] if frame is not None and "factor" in frame else None
+                else:
+                    factor_df = self._load_cached_factor(stock_code, source)
 
             if factor_df is None or factor_df.empty:
                 return None
@@ -1166,7 +1195,7 @@ class DataManager:
 
         stock_codes = [code for code in stock_codes if code != exclude_code] or stock_codes
         random.shuffle(stock_codes)
-        max_attempts = min(len(stock_codes), 80)
+        max_attempts = min(len(stock_codes), 3)
         for stock_code in stock_codes[:max_attempts]:
             date_range = self._get_stock_date_range(stock_code, source=source, interval=interval)
             if date_range is None:
@@ -1177,7 +1206,7 @@ class DataManager:
             if available_start <= available_end:
                 return stock_code, self._random_date_in_range(available_start, available_end)
 
-        raise ValueError("所选数据源中没有符合条件的股票，请调整板块或日期范围后重试")
+        raise ValueError("本次最多尝试 3 只股票，公开源失败或历史不足；请重试或调整日期范围")
 
     def _build_offline_path(self, stock_code: str) -> str:
         stock_code = self._normalize_stock_code(stock_code)
@@ -1204,12 +1233,15 @@ class DataManager:
         if source == "offline":
             raise ValueError("离线数据不能作为在线补数源。")
 
-        if self._get_offline_file(stock_code) and "galaxy" + os.sep in self._get_offline_file(stock_code):
-            raise ValueError("该股票已使用银河归档，请继续用银河补数，避免混合不同来源")
-        existing = self.get_stock_data(stock_code, source="offline", interval="daily")
-        existing_factor = self.get_factor_data(stock_code, source="offline", interval="daily")
+        # The generic offline reader intentionally prefers Galaxy. Never use it
+        # as the merge target for another provider's download.
+        offline_path = self._get_public_archive(stock_code, source)
+        os.makedirs(os.path.dirname(offline_path), exist_ok=True)
+        existing = (self._normalize_offline_data(self._read_csv_with_fallback(offline_path))
+                    if os.path.isfile(offline_path) else None)
+        existing_factor = (existing[["date", "factor"]].copy()
+                           if existing is not None and "factor" in existing else None)
         request_start, request_end = self._normalize_sync_range(start_date=start_date, end_date=end_date)
-        offline_path = self._build_offline_path(stock_code)
 
         range_before = None
         previous_rows = 0
@@ -1408,6 +1440,8 @@ class DataManager:
 
         merged = self._attach_factor_column(merged, merged_factor)
 
+        if "source" in merged and "actual_source" not in merged:
+            merged["actual_source"] = merged["source"]
         merged["source"] = source
         merged["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 

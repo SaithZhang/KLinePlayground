@@ -71,5 +71,7 @@ def inventory(manager, date_start, date_end, sector='all'):
                 downloaded_stocks=downloaded, three_period_stocks=three_periods, eligible_stocks=eligible_count,
                 period_counts=counts, exclusions=dict(exclusions), rows=rows,
                 universe_count=len(universe.get('codes', [])), universe_as_of=universe.get('as_of'),
-                other_daily_files=len(list(Path(manager.offline_dir).glob('*.csv'))),
+                other_daily_files=(len(list(Path(manager.offline_dir).glob('*.csv'))) +
+                    sum(len(list((Path(manager.offline_dir) / source / 'daily').glob('*.csv')))
+                        for source in ('a_stock_data', 'akshare', 'xtdata', 'mootdx'))),
                 date_start=str(start.date()), date_end=str(end.date()), sector=sector)

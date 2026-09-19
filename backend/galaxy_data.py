@@ -1,4 +1,5 @@
 """Shared Galaxy archive contract for Windows native and macOS Docker workers."""
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -48,11 +49,73 @@ def stop_runtime(run, mode, command, env):
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
 
 
+_batch_local = threading.local()
+
+
+class GalaxyBatch:
+    def __init__(self):
+        self.run = None
+        self.failed = False
+        self.temp = None
+
+    def start(self):
+        if self.failed:
+            raise ValueError("银河批次运行进程已中断；未自动重启或重试")
+        if self.run is not None:
+            if self.run.poll() is not None:
+                self.failed = True
+                raise ValueError("银河批次运行进程已退出；未自动重启或重试")
+            return
+        runtime = ROOT / "data" / "galaxy_requests"
+        runtime.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix="batch-", dir=runtime)
+        self.directory = Path(self.temp.name)
+        self.mode, executable, self.env = galaxy_runtime.launch_spec()
+        self.command = [executable, str(ROOT / "scripts" / "galaxy_worker.py"), "--serve", str(self.directory)]
+        try:
+            self.run = subprocess.Popen(self.command, cwd=ROOT, env=self.env, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, **galaxy_runtime.process_options())
+        except OSError:
+            self.failed = True
+            raise ValueError("银河批次运行环境启动失败") from None
+
+    def close(self):
+        try:
+            if self.run is not None:
+                (self.directory / "STOP").touch()
+                try:
+                    self.run.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    stop_runtime(self.run, self.mode, self.command, self.env)
+        finally:
+            if self.temp is not None:
+                self.temp.cleanup()
+
+
+@contextmanager
+def galaxy_batch():
+    """One batch/thread owns one worker, lazily launched even for universe lookup."""
+    previous = getattr(_batch_local, "session", None)
+    session = GalaxyBatch()
+    _batch_local.session = session
+    try:
+        yield session
+    finally:
+        _batch_local.session = previous
+        session.close()
+
+
 def query_galaxy(code, start, end, periods):
     report_progress('RUNTIME')
-    mode, executable, env = galaxy_runtime.launch_spec()
-    runtime = ROOT / "data" / "galaxy_requests"
-    runtime.mkdir(parents=True, exist_ok=True)
+    batch = getattr(_batch_local, "session", None)
+    if batch is not None:
+        batch.start()
+        mode, env = batch.mode, batch.env
+        runtime = batch.directory
+    else:
+        mode, executable, env = galaxy_runtime.launch_spec()
+        runtime = ROOT / "data" / "galaxy_requests"
+        runtime.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=runtime) as tmp:
         request, output = Path(tmp) / "request.json", Path(tmp) / "output.json"
         body = {"code": code, "start": start.strftime("%Y%m%d"),
@@ -63,13 +126,18 @@ def query_galaxy(code, start, end, periods):
             if (calendar.get("full") and calendar.get("as_of") == pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d")
                     and calendar["start"] <= body["start"] and calendar["end"] >= body["end"]):
                 body["calendar"] = [int(day) for day in calendar["dates"]]
-        request.write_text(json.dumps(body), encoding="utf-8")
-        command = [executable, str(ROOT / "scripts" / "galaxy_worker.py"), str(request), str(output)]
-        try:
-            run = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, **galaxy_runtime.process_options())
-        except OSError:
-            raise ValueError("银河运行环境启动失败，请检查原生 Python 或 Docker skill 配置") from None
+        pending = request.with_suffix(".tmp")
+        pending.write_text(json.dumps(body), encoding="utf-8")
+        pending.replace(request)
+        if batch is not None:
+            command, run = batch.command, batch.run
+        else:
+            command = [executable, str(ROOT / "scripts" / "galaxy_worker.py"), str(request), str(output)]
+            try:
+                run = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, **galaxy_runtime.process_options())
+            except OSError:
+                raise ValueError("银河运行环境启动失败，请检查原生 Python 或 Docker skill 配置") from None
         started = last_progress = time.monotonic()
         stage = "RUNTIME"
         stage_path = Path(str(output) + ".stage")
@@ -77,8 +145,10 @@ def query_galaxy(code, start, end, periods):
             # QEMU initialization, factors and each period can each take over a minute.
             # Bound both a stalled phase and the whole request; never retry automatically.
             while run.poll() is None:
+                if batch is not None and output.with_suffix(".done").is_file():
+                    break
                 try:
-                    run.wait(timeout=5)
+                    run.wait(timeout=0.2 if batch is not None else 5)
                 except subprocess.TimeoutExpired:
                     observed_stage = stage_path.read_text(encoding="utf-8") if stage_path.exists() else stage
                     if observed_stage and observed_stage != stage:
@@ -87,6 +157,8 @@ def query_galaxy(code, start, end, periods):
                     if time.monotonic() - last_progress > 180 or time.monotonic() - started > 480:
                         raise
         except subprocess.TimeoutExpired:
+            if batch is not None:
+                batch.failed = True
             stop_runtime(run, mode, command, env)
             if output.is_file():
                 partial = json.loads(output.read_text(encoding="utf-8"))
@@ -95,7 +167,9 @@ def query_galaxy(code, start, end, periods):
                         partial["periods"].setdefault(period, {"error": "GALAXY_TIMEOUT_" + stage})
                     return partial
             raise ValueError(f"银河查询 {stage} 超时（单阶段 180 秒/整次 480 秒）；本地文件未改动，请缩短区间后手动重试") from None
-        if run.returncode or not output.is_file():
+        if run.returncode or not output.is_file() or (batch is not None and not output.with_suffix(".done").is_file()):
+            if batch is not None:
+                batch.failed = True
             stage = stage_path.read_text(encoding="utf-8") if stage_path.is_file() else stage
             raise ValueError(f"银河运行失败（阶段 {stage}，退出码 {run.returncode}）；请检查原生 SDK/Python 或 Docker skill")
         result = json.loads(output.read_text(encoding="utf-8"))

@@ -1,5 +1,5 @@
 """Observable one-shot work inside the existing Flask process; JSON receipts survive reloads."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 import json
 import logging
@@ -144,6 +144,12 @@ class DataJobs:
             self._update(ident, stop_requested=True)
 
     def run_sync(self, ident, manager, config):
+        from backend.galaxy_data import galaxy_batch
+        context = galaxy_batch() if config['source'] == 'galaxy' else nullcontext(None)
+        with context as batch:
+            return self._run_sync_batch(ident, manager, config, batch)
+
+    def _run_sync_batch(self, ident, manager, config, batch):
         report_progress('UNIVERSE')
         scope = config.get('scope', 'single')
         codes = [config['stock_code']] if scope == 'single' else manager.get_stock_universe(scope, source=config['source'])
@@ -181,6 +187,9 @@ class DataJobs:
                 self._save(item)
                 self._log(ident, 'STOCK_RESULT', stock_code=code, status=record['status'],
                           processed=item['processed'], total=item['total'])
+            if batch is not None and batch.failed:
+                self._update(ident, error='银河运行进程中断，已停止批次；剩余股票未请求，未自动重启。')
+                break
             consecutive_failures = consecutive_failures + 1 if record['status'] == 'FAILED' else 0
             if consecutive_failures >= 3:
                 self._update(ident, error='连续3只请求失败，已停止本批，剩余股票未请求。请查看失败原因后重试。')

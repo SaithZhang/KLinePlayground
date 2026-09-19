@@ -1624,8 +1624,15 @@ function blindIdentityHidden() {
 }
 
 function updateGalaxyPoolControl() {
-    document.getElementById('galaxy-pool-group').classList.toggle('hidden',
-        document.getElementById('data-source').value !== 'galaxy');
+    const source = document.getElementById('data-source').value;
+    document.getElementById('galaxy-pool-group').classList.toggle('hidden', source !== 'galaxy');
+    const hasMinutes = ['galaxy', 'offline'].includes(source);
+    const period = document.getElementById('kline-period');
+    for (const option of period.options) option.disabled = !hasMinutes && option.value !== 'daily';
+    if (!hasMinutes) period.value = 'daily';
+    const practice = document.getElementById('training-practice');
+    practice.querySelector('option[value="ma55"]').disabled = !hasMinutes;
+    if (!hasMinutes) practice.value = 'free';
 }
 
 function formatChartTime(time) {
@@ -1706,7 +1713,7 @@ async function startTraining() {
             cachedGalaxy ? '本次不联网：筛选本地股票和日期，计算 MA 并绘制图表。'
                 : dataSource === 'galaxy' ? '已有可用数据直接读取；缺失时下载三周期行情，可能需要数分钟。' : '正在准备图表和训练数据...'
         );
-        trainingConfig.background = dataSource === 'galaxy' && !cachedGalaxy;
+        trainingConfig.background = dataSource !== 'offline' && !cachedGalaxy;
         const response = await fetch(`${API_BASE}/training/start`, {
             method: 'POST',
             headers: {
